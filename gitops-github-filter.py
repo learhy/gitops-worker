@@ -17,6 +17,9 @@ Conventions:
   - issue_comment.created on an issue labeled "agent:cole":
       body == go / 👍 / lgtm / ship it             -> instruction "execute"
       anything else with the label present          -> ignored (use @cole to discuss)
+  - pull_request_review.submitted by learhy (approved / changes_requested)
+                                                   -> instruction "review-submitted"
+    (run the merge gate / review loop on that PR now)
   - All other issues / pull_request / push events are ignored.
 """
 import json
@@ -126,6 +129,22 @@ if "issue" in payload and "comment" in payload:  # issue_comment event
     # state-derivation cycle (catches loosely-phrased approvals like "Go, great").
     if WORK_LABEL in labels:
         out["hermes_instruction"] = "cycle"
+        print(json.dumps(out))
+        sys.exit(0)
+    sys.exit(0)
+
+# pull_request_review event: learhy approving (or requesting changes on) a
+# PR is exactly when the merge gate's answer changes, so wake the worker to
+# run the gate on that PR now instead of on the next poll. Needs the GitHub
+# App subscribed to "Pull request review" events.
+if "review" in payload and "pull_request" in payload:
+    review = payload.get("review") or {}
+    reviewer = (review.get("user") or {}).get("login", "")
+    state = (review.get("state") or "").lower()
+    if (action == "submitted" and reviewer == "learhy"
+            and state in ("approved", "changes_requested")):
+        out["hermes_instruction"] = "review-submitted"
+        out["hermes_pr_number"] = (payload.get("pull_request") or {}).get("number")
         print(json.dumps(out))
         sys.exit(0)
     sys.exit(0)

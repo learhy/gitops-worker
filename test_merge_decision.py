@@ -639,5 +639,162 @@ else:
         self.assertEqual(code, 2)
 
 
+# A PR's own change, and the same change after master moved and the PR was
+# updated from master: the hunk line numbers shift, the lines don't.
+JS_PATCH_OLD = ("@@ -120,7 +120,7 @@ function headline(c) {\n"
+                "   var cap = c.ceiling;\n"
+                "-  return 'levels off at 60%';\n"
+                "+  return 'levels off at ' + cap + '%';\n")
+JS_PATCH_NEW = JS_PATCH_OLD.replace("@@ -120,7 +120,7 @@", "@@ -131,7 +131,7 @@")
+LOG_PATCH_OLD = "@@ -1,3 +1,6 @@\n # Changelog\n+## 2026-11-02 fix #241\n+- headline cap\n+\n"
+LOG_PATCH_NEW = ("@@ -1,9 +1,12 @@\n # Changelog\n+## 2026-11-02 fix #241\n+- headline cap\n+\n"
+                 " ## 2026-11-02 fix #255\n")
+
+
+def carry(old_files=None, new_files=None, status="ahead", sha=OLD_SHA, error=None):
+    c = {
+        "approved_sha": sha,
+        "ancestry_status": status,
+        "old_files": old_files if old_files is not None else [
+            {"filename": "web/js/np.js", "status": "modified", "patch": JS_PATCH_OLD},
+            {"filename": "CHANGELOG.md", "status": "modified", "patch": LOG_PATCH_OLD},
+        ],
+        "new_files": new_files if new_files is not None else [
+            {"filename": "web/js/np.js", "status": "modified", "patch": JS_PATCH_NEW},
+            {"filename": "CHANGELOG.md", "status": "modified", "patch": LOG_PATCH_NEW},
+        ],
+    }
+    if error:
+        c["error"] = error
+    return c
+
+
+class ApprovalCarryOver(unittest.TestCase):
+    """2026-11-02: every cole PR adds a CHANGELOG entry, so merging one PR of
+    an approved batch conflicts the rest; Cole merges master into each, which
+    makes a new head. An approval carries over iff the PR's own change is
+    identical, so a batch drains in one cycle instead of one review run per PR."""
+
+    def held_state(self, **overrides):
+        base = dict(
+            head_sha=NEW_SHA,
+            linked_issues=[issue(number=241, body=COPY_REVIEW_BODY,
+                                 labels=["agent:cole", "copy-review", "methods"])],
+            pr_reviews=[review(LEARNY, "APPROVED", OLD_SHA, iso(10, 0))],
+            approval_carryover=carry(),
+        )
+        base.update(overrides)
+        return make_state(**base)
+
+    def test_conflict_only_update_keeps_approval(self):
+        decision = decide_merge(self.held_state())
+        self.assertEqual(decision["decision"], "MERGE", decision["reason"])
+        self.assertIn("carried over a conflict-only update", decision["reason"])
+
+    def test_changed_code_needs_a_new_approval(self):
+        changed = JS_PATCH_NEW.replace("cap + '%'", "cap + ' percent'")
+        state = self.held_state(approval_carryover=carry(new_files=[
+            {"filename": "web/js/np.js", "status": "modified", "patch": changed},
+            {"filename": "CHANGELOG.md", "status": "modified", "patch": LOG_PATCH_NEW},
+        ]))
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("web/js/np.js changed since approval", decision["reason"])
+
+    def test_added_file_needs_a_new_approval(self):
+        files = carry()["new_files"] + [
+            {"filename": "web/js/extra.js", "status": "added", "patch": "@@ -0,0 +1 @@\n+x\n"}]
+        decision = decide_merge(self.held_state(approval_carryover=carry(new_files=files)))
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("files differ since approval", decision["reason"])
+
+    def test_edited_log_entry_needs_a_new_approval(self):
+        edited = LOG_PATCH_NEW.replace("headline cap", "headline cap and more")
+        state = self.held_state(approval_carryover=carry(new_files=[
+            {"filename": "web/js/np.js", "status": "modified", "patch": JS_PATCH_NEW},
+            {"filename": "CHANGELOG.md", "status": "modified", "patch": edited},
+        ]))
+        self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_approved_commit_not_an_ancestor(self):
+        state = self.held_state(approval_carryover=carry(status="diverged"))
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("not an ancestor", decision["reason"])
+
+    def test_missing_patch_refuses(self):
+        files = [dict(f, patch=None) if f["filename"] == "web/js/np.js" else f
+                 for f in carry()["new_files"]]
+        self.assertEqual(decide_merge(self.held_state(
+            approval_carryover=carry(new_files=files)))["decision"], "HOLD")
+
+    def test_fetch_error_refuses(self):
+        self.assertEqual(decide_merge(self.held_state(
+            approval_carryover=carry(error="compare failed (HTTP 502)")))["decision"], "HOLD")
+
+    def test_newer_changes_requested_still_holds(self):
+        state = self.held_state(pr_reviews=[
+            review(LEARNY, "APPROVED", OLD_SHA, iso(10, 0)),
+            review(LEARNY, "CHANGES_REQUESTED", OLD_SHA, iso(10, 30)),
+        ])
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("CHANGES_REQUESTED", decision["reason"])
+
+    def test_carry_needs_a_real_learhy_approval(self):
+        state = self.held_state(pr_reviews=[review("someoneelse", "APPROVED", OLD_SHA, iso(10, 0))])
+        self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_hold_comment_still_holds(self):
+        state = self.held_state(pr_comments=[comment(LEARNY, "do not merge, wait for me", iso(10, 5))])
+        self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_still_needs_clean(self):
+        self.assertEqual(decide_merge(self.held_state(mergeable_state="dirty"))["decision"], "HOLD")
+
+    def test_fetch_state_gathers_carryover(self):
+        pr = {"head": {"sha": NEW_SHA}, "base": {"ref": "master"}, "body": "Closes #241",
+              "labels": [], "mergeable_state": "clean"}
+        reviews = [{"user": {"login": LEARNY}, "state": "APPROVED", "commit_id": OLD_SHA,
+                    "submitted_at": iso(10, 0)}]
+        c = carry()
+        responses = {
+            "repos/learhy/x/pulls/228": pr,
+            "repos/learhy/x/issues/228/comments?per_page=100": [],
+            "repos/learhy/x/pulls/228/reviews?per_page=100": reviews,
+            "repos/learhy/x/commits/%s/check-runs?per_page=100" % NEW_SHA: {"check_runs": []},
+            "repos/learhy/x/issues/241": {"body": COPY_REVIEW_BODY,
+                                          "labels": [{"name": "methods"}]},
+            "repos/learhy/x/issues/241/comments?per_page=100": [],
+            "repos/learhy/x/compare/%s...%s" % (OLD_SHA, NEW_SHA): {"status": "ahead"},
+            "repos/learhy/x/compare/master...%s" % OLD_SHA: {"files": c["old_files"]},
+            "repos/learhy/x/compare/master...%s" % NEW_SHA: {"files": c["new_files"]},
+        }
+        state = github_state.fetch_state("learhy/x", 228, runner=lambda a: responses[a[0]])
+        self.assertEqual(state["approval_carryover"]["approved_sha"], OLD_SHA)
+        self.assertEqual(decide_merge(state)["decision"], "MERGE")
+
+    def test_no_carryover_fetch_when_head_is_approved(self):
+        calls = []
+        pr = {"head": {"sha": HEAD}, "body": "Closes #221", "labels": [], "mergeable_state": "clean"}
+
+        def runner(args):
+            calls.append(args[0])
+            if args[0].endswith("/pulls/228"):
+                return pr
+            if "reviews" in args[0]:
+                return [{"user": {"login": LEARNY}, "state": "APPROVED", "commit_id": HEAD,
+                         "submitted_at": iso(10, 0)}]
+            if "check-runs" in args[0]:
+                return {"check_runs": []}
+            if args[0].endswith("/issues/221"):
+                return {"body": "x", "labels": []}
+            return []
+
+        state = github_state.fetch_state("learhy/x", 228, runner=runner)
+        self.assertIsNone(state["approval_carryover"])
+        self.assertFalse([c for c in calls if "/compare/" in c])
+
+
 if __name__ == "__main__":
     unittest.main()

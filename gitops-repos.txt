@@ -1,0 +1,2 @@
+# Repos the GitOps worker (Cole) monitors. One owner/repo per line.
+learhy/aidisruption.fyi

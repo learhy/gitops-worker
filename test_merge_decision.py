@@ -483,6 +483,46 @@ class MultiIssuePrs(unittest.TestCase):
         self.assertEqual(parse("Closes #241, see also #999"), [241])
 
 
+class CheckRunsForbidden(unittest.TestCase):
+    """A GitHub App token without checks:read gets HTTP 403 on check-runs.
+
+    The fetch must degrade to no check data (mergeable_state still carries
+    the CI signal), not fail the whole state fetch.
+    """
+    FORBIDDEN = ("gh api repos/learhy/x/commits/%s/check-runs?per_page=100 "
+                 "failed (exit 1): gh: Resource not accessible by integration "
+                 "(HTTP 403)" % HEAD)
+
+    def test_403_on_check_runs_degrades_to_empty(self):
+        def runner(args):
+            path = args[0]
+            if path == "repos/learhy/x/pulls/228":
+                return {"head": {"sha": HEAD}, "body": "Closes #221",
+                        "labels": [], "mergeable_state": "clean"}
+            if "check-runs" in path:
+                raise github_state.GithubStateError(self.FORBIDDEN)
+            if path == "repos/learhy/x/issues/221":
+                return {"body": "work", "labels": [{"name": "cole:go-and-merge"}]}
+            return []
+
+        state = github_state.fetch_state("learhy/x", 228, runner=runner)
+        self.assertEqual(state["check_runs"], [])
+        self.assertEqual(state["mergeable_state"], "clean")
+
+    def test_non_403_check_runs_failure_still_raises(self):
+        def runner(args):
+            path = args[0]
+            if path == "repos/learhy/x/pulls/228":
+                return {"head": {"sha": HEAD}, "body": "Closes #221",
+                        "labels": [], "mergeable_state": "clean"}
+            if "check-runs" in path:
+                raise github_state.GithubStateError("gh api failed: timeout")
+            return []
+
+        with self.assertRaises(github_state.GithubStateError):
+            github_state.fetch_state("learhy/x", 228, runner=runner)
+
+
 class MergeableStateRetry(unittest.TestCase):
     def test_unknown_mergeable_state_is_reread(self):
         reads = {"n": 0}

@@ -5,6 +5,9 @@ GitHub issues in, PRs out, auto-deploy on merge.
 
 Files here are the live sources:
 - `gitops-worker-prompt.md` — the worker's prompt (deployed via `hermes cron edit`)
+- `merge_decision.py` — the merge-decision gate: decides merge rights at merge time from fresh GitHub state (HOLD/MERGE + one-line audit record); `--merge` executes the merge with expected-head-SHA protection and maps a GitHub-side rejection to HOLD
+- `github_state.py` — fetches that fresh state via `gh api` and shapes it for the gate
+- `test_merge_decision.py` — unit tests for the gate (in-memory GitHub state, incl. the #221/#228 incident replay)
 - `gitops-github-filter.py` — webhook payload filter (routes label/comment/push events)
 - `gitops-ledger-sync.py` — run ledger sync + status page data
 - `gh-app-token.sh` — GitHub App installation-token mint/cache

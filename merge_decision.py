@@ -80,6 +80,11 @@ RELEASE_RE = re.compile(r"release\s+(?:the\s+)?hold|ok(?:ay)?\s+to\s+merge", re.
 # A release phrase preceded by one of these is not a release ("not ok to merge").
 NEGATION_RE = re.compile(r"(?:\bnot|\bnever|\bno|n['’]t)\s*(?:yet\s+)?$", re.IGNORECASE)
 
+# Append-only logs every PR writes to. A merge from master moves an entry
+# within these files without changing it.
+LOG_FILES = ("CHANGELOG.md", "docs/DECISIONS.md")
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
 FAILED_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 
 
@@ -233,6 +238,58 @@ def _current_head_approval(state: Dict, head_sha: str) -> Optional[str]:
     return (best or {}).get("commit_id")
 
 
+def _normalized_patch(patch: str) -> List[str]:
+    """Patch lines with hunk line numbers stripped (they shift when master
+    adds lines elsewhere in the same file; the change itself doesn't)."""
+    return [HUNK_HEADER_RE.sub("@@", line) for line in patch.splitlines()]
+
+
+def _log_entry_lines(patch: str):
+    lines = patch.splitlines()
+    return (sorted(l for l in lines if l.startswith("+")),
+            sorted(l for l in lines if l.startswith("-")))
+
+
+def conflict_only_update(carry: Optional[Dict]):
+    """(True, why) if the PR's net change at its current head is identical to
+    its net change at the commit learhy approved, apart from where its own
+    entries sit in the append-only logs. Anything else: (False, why).
+
+    Net change = three-dot compare against the base branch (the diff from the
+    merge-base), so a merge of master into the PR contributes nothing unless
+    the conflict resolution itself changed the PR's lines.
+    """
+    if not carry:
+        return False, "no earlier learhy approval"
+    old_sha = _short(carry.get("approved_sha"))
+    if carry.get("error"):
+        return False, "approval on %s not carried: %s" % (old_sha, _one_line(carry["error"])[:160])
+    if carry.get("ancestry_status") not in ("ahead", "identical"):
+        return False, ("approval on %s not carried: it is not an ancestor of the head (%s)"
+                       % (old_sha, carry.get("ancestry_status")))
+    old = {f["filename"]: f for f in carry.get("old_files") or []}
+    new = {f["filename"]: f for f in carry.get("new_files") or []}
+    if not old:
+        return False, "approval on %s not carried: no diff recorded for it" % old_sha
+    if set(old) != set(new):
+        changed = sorted(set(old) ^ set(new))
+        return False, ("approval on %s not carried: files differ since approval (%s)"
+                       % (old_sha, ", ".join(changed[:5])))
+    for name in sorted(old):
+        po, pn = old[name].get("patch"), new[name].get("patch")
+        if po is None or pn is None:
+            return False, "approval on %s not carried: no patch for %s" % (old_sha, name)
+        if old[name].get("status") != new[name].get("status"):
+            return False, "approval on %s not carried: %s changed since approval" % (old_sha, name)
+        if name in LOG_FILES:
+            if _log_entry_lines(po) != _log_entry_lines(pn):
+                return False, ("approval on %s not carried: the PR's %s entry changed"
+                               % (old_sha, name))
+        elif _normalized_patch(po) != _normalized_patch(pn):
+            return False, "approval on %s not carried: %s changed since approval" % (old_sha, name)
+    return True, "learhy approval on %s carried over a conflict-only update" % old_sha
+
+
 def _failed_checks(state: Dict) -> List[str]:
     return [
         c.get("name") or "unnamed check"
@@ -286,6 +343,24 @@ def decide_merge(state: Dict) -> Dict:
     """Pure merge-rights decision from fresh, structured GitHub state."""
     head = state.get("head_sha") or ""
     approval_sha = _current_head_approval(state, head)
+    carried_note = None
+    carried_from = None
+    carry = state.get("approval_carryover")
+    if approval_sha is None and carry:
+        carried, carried_note = conflict_only_update(carry)
+        # The carried approval must be a real learhy APPROVED review.
+        if carried and not any(
+            r.get("author") == AUTHORITY and r.get("state") == "APPROVED"
+            and r.get("commit_id") == carry.get("approved_sha")
+            for r in state.get("pr_reviews", [])
+        ):
+            carried, carried_note = False, "no learhy approval on %s" % _short(carry.get("approved_sha"))
+        if carried:
+            carried_from = carry.get("approved_sha")
+            # The current head carries the same change learhy approved, so the
+            # approval stands for it. Absolute holds (a newer CHANGES_REQUESTED,
+            # a hold comment) still apply below.
+            approval_sha = head
     review_holds, absolute_holds = _classified_holds(state)
     linked = state.get("linked_issues", [])
     # go-and-merge authorizes only if EVERY linked issue carries it: a PR
@@ -302,7 +377,10 @@ def decide_merge(state: Dict) -> Dict:
     #    path (a); path (b), a learhy approval on the current head, is
     #    their release.
     if review_holds and approval_sha is None:
-        return _decision(state, "HOLD", review_holds[0], approval_sha)
+        reason = review_holds[0]
+        if carried_note:
+            reason += " (%s)" % carried_note
+        return _decision(state, "HOLD", reason, approval_sha)
 
     # 3. Authorization: go-and-merge label now, or current-head approval.
     if not (go_label or approval_sha):
@@ -324,9 +402,13 @@ def decide_merge(state: Dict) -> Dict:
     if failed:
         return _decision(state, "HOLD", "check run failed: %s" % failed[0], approval_sha)
 
-    return _decision(state, "MERGE", "authorized (%s), clean, checks green"
-                     % ("learhy approval on head %s" % _short(approval_sha)
-                        if approval_sha else "cole:go-and-merge on linked issue"),
+    if carried_from:
+        authorized = carried_note
+    elif approval_sha:
+        authorized = "learhy approval on head %s" % _short(approval_sha)
+    else:
+        authorized = "cole:go-and-merge on linked issue"
+    return _decision(state, "MERGE", "authorized (%s), clean, checks green" % authorized,
                      approval_sha)
 
 

@@ -187,6 +187,8 @@ def fetch_state(repo: str, pr_number: int, runner: Callable = default_runner,
                 "labels": [l.get("name") for l in (issue.get("labels") or []) if l.get("name")],
                 "comments": [_comment(c) for c in issue_comments],
             })
+
+        carryover = _fetch_carryover(repo, pr, head_sha, pr_reviews, runner)
     except GithubStateError:
         raise
     except Exception as exc:  # noqa: BLE001 — wrap anything unexpected
@@ -204,7 +206,55 @@ def fetch_state(repo: str, pr_number: int, runner: Callable = default_runner,
             for cr in (checks.get("check_runs") or [])
         ],
         "linked_issues": linked,
+        "approval_carryover": carryover,
         "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+APPROVER = "learhy"
+
+
+def _latest_approval_sha(reviews: List[Dict]) -> str:
+    """Commit of learhy's most recent APPROVED review ('' if none)."""
+    best = None
+    for r in reviews or []:
+        if (r.get("user") or {}).get("login") != APPROVER or r.get("state") != "APPROVED":
+            continue
+        if best is None or (r.get("submitted_at") or "") >= (best.get("submitted_at") or ""):
+            best = r
+    return (best or {}).get("commit_id") or ""
+
+
+def _fetch_carryover(repo: str, pr: Dict, head_sha: str, reviews: List[Dict],
+                     runner: Callable):
+    """Evidence for carrying learhy's approval across a conflict-only update.
+
+    Only gathered when learhy's latest approval is on an OLDER commit. Returns
+    None when there is nothing to carry. A fetch failure is recorded, never
+    raised: the gate then simply doesn't carry the approval (HOLD).
+    """
+    old = _latest_approval_sha(reviews)
+    if not old or old == head_sha:
+        return None
+    base = ((pr.get("base") or {}).get("ref")) or "master"
+    try:
+        ancestry = runner(["repos/%s/compare/%s...%s" % (repo, old, head_sha)]) or {}
+        old_cmp = runner(["repos/%s/compare/%s...%s" % (repo, base, old)]) or {}
+        new_cmp = runner(["repos/%s/compare/%s...%s" % (repo, base, head_sha)]) or {}
+    except GithubStateError as exc:
+        return {"approved_sha": old, "error": str(exc)}
+
+    def files(cmp: Dict) -> List[Dict]:
+        return [
+            {"filename": f.get("filename"), "status": f.get("status"), "patch": f.get("patch")}
+            for f in (cmp.get("files") or [])
+        ]
+
+    return {
+        "approved_sha": old,
+        "ancestry_status": ancestry.get("status"),
+        "old_files": files(old_cmp),
+        "new_files": files(new_cmp),
     }
 
 

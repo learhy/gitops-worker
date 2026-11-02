@@ -171,9 +171,25 @@ def fetch_state(repo: str, pr_number: int, runner: Callable = default_runner,
             "repos/%s/pulls/%d/reviews?per_page=%d" % (repo, pr_number, COMMENTS_PER_PAGE),
         ]) or []
         head_sha = (pr.get("head") or {}).get("sha") or ""
-        checks = runner([
-            "repos/%s/commits/%s/check-runs?per_page=%d" % (repo, head_sha, CHECK_RUNS_PER_PAGE),
-        ]) or {}
+        try:
+            checks = runner([
+                "repos/%s/commits/%s/check-runs?per_page=%d" % (repo, head_sha, CHECK_RUNS_PER_PAGE),
+            ]) or {}
+        except GithubStateError as exc:
+            # The GitHub App installation token (minted above) carries
+            # issues/PRs/refs/contents — not checks:read — so this one
+            # endpoint returns HTTP 403 even though the rest of the state
+            # is readable. The CI signal is not lost: mergeable_state
+            # (fetched above, readable without checks:read) already turns
+            # failing/blocked CI into "unstable"/"blocked", and
+            # decide_merge requires "clean". Degrade to no check data
+            # instead of discarding the whole state fetch (which would
+            # HOLD every PR forever and make the gate unable to ever
+            # output MERGE).
+            if "403" in str(exc):
+                checks = {}
+            else:
+                raise
 
         linked: List[Dict] = []
         for number in parse_linked_issues(pr.get("body") or ""):

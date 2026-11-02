@@ -723,13 +723,60 @@ class ApprovalCarryOver(unittest.TestCase):
         self.assertEqual(decision["decision"], "HOLD")
         self.assertIn("files differ since approval", decision["reason"])
 
-    def test_edited_log_entry_needs_a_new_approval(self):
-        edited = LOG_PATCH_NEW.replace("headline cap", "headline cap and more")
+    def test_reworded_changelog_entry_still_carries(self):
+        # 2026-11-02: Cole rewords its CHANGELOG entry when resolving
+        # conflicts; that internal log no longer costs the approval.
+        edited = LOG_PATCH_NEW.replace("headline cap", "headline cap (updated from master)")
         state = self.held_state(approval_carryover=carry(new_files=[
             {"filename": "web/js/np.js", "status": "modified", "patch": JS_PATCH_NEW},
             {"filename": "CHANGELOG.md", "status": "modified", "patch": edited},
         ]))
+        self.assertEqual(decide_merge(state)["decision"], "MERGE")
+
+    def test_cache_bust_token_bump_still_carries(self):
+        # 2026-11-02: #263/#290/#293 each replace the shared scenarios.js?v=
+        # token; after master moved, the line they replace changed.
+        old = ("@@ -35,7 +35,7 @@\n OCC_HTML = 1\n"
+               "-CACHE_BUST = \"scenarios.js?v=20261102a\"\n"
+               "+CACHE_BUST = \"scenarios.js?v=20261102-pr290\"\n")
+        new = old.replace("v=20261102a", "v=20261102b")
+        state = self.held_state(approval_carryover=carry(
+            old_files=carry()["old_files"] + [
+                {"filename": "tests/test_x.py", "status": "modified", "patch": old}],
+            new_files=carry()["new_files"] + [
+                {"filename": "tests/test_x.py", "status": "modified", "patch": new}],
+        ))
+        self.assertEqual(decide_merge(state)["decision"], "MERGE")
+
+    def test_other_line_changes_still_refuse(self):
+        old = "@@ -1,2 +1,2 @@\n-x = 1\n+x = 2\n"
+        new = "@@ -1,2 +1,2 @@\n-x = 1\n+x = 3\n"
+        state = self.held_state(approval_carryover=carry(
+            old_files=carry()["old_files"] + [
+                {"filename": "web/js/y.js", "status": "modified", "patch": old}],
+            new_files=carry()["new_files"] + [
+                {"filename": "web/js/y.js", "status": "modified", "patch": new}],
+        ))
         self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_changelog_only_on_one_side_still_carries(self):
+        state = self.held_state(approval_carryover=carry(new_files=[
+            {"filename": "web/js/np.js", "status": "modified", "patch": JS_PATCH_NEW},
+        ]))
+        self.assertEqual(decide_merge(state)["decision"], "MERGE")
+
+    def test_edited_decisions_entry_needs_a_new_approval(self):
+        dec_old = "@@ -10,3 +10,6 @@\n ## DEC-130\n+## DEC-131 adoption cap\n+- 80% ceiling\n"
+        dec_new = "@@ -12,3 +12,6 @@\n ## DEC-130\n+## DEC-131 adoption cap\n+- 60% ceiling\n"
+        state = self.held_state(approval_carryover=carry(
+            old_files=carry()["old_files"] + [
+                {"filename": "docs/DECISIONS.md", "status": "modified", "patch": dec_old}],
+            new_files=carry()["new_files"] + [
+                {"filename": "docs/DECISIONS.md", "status": "modified", "patch": dec_new}],
+        ))
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("DECISIONS.md entry changed", decision["reason"])
 
     def test_approved_commit_not_an_ancestor(self):
         state = self.held_state(approval_carryover=carry(status="diverged"))

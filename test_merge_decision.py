@@ -516,6 +516,11 @@ class CliRejectionPath(unittest.TestCase):
 
     FAKE_GH = r'''#!/usr/bin/env python3
 import json, os, sys
+with open(os.environ["FAKE_GH_LOG"], "a") as log:
+    log.write(os.environ.get("GH_TOKEN", "<none>") + "\n")
+if os.environ.get("GH_TOKEN") != "app-token-123":
+    sys.stderr.write("gh: Bad credentials (HTTP 401)\n")
+    sys.exit(1)
 a = sys.argv[1:]
 if "--method" in a:
     sys.stderr.write("gh: %s (HTTP %s)\n" % ("refused", os.environ["FAKE_MERGE_STATUS"]))
@@ -532,7 +537,7 @@ else:
     print("[]")
 '''
 
-    def run_cli(self, status):
+    def run_cli(self, status, token_script="#!/bin/sh\nprintf app-token-123\n"):
         import json as _json
         import os
         import subprocess
@@ -544,16 +549,39 @@ else:
             with open(gh, "w") as fh:
                 fh.write(self.FAKE_GH)
             os.chmod(gh, 0o755)
+            mint = os.path.join(tmp, "gh-app-token.sh")
+            with open(mint, "w") as fh:
+                fh.write(token_script)
+            os.chmod(mint, 0o755)
+            log = os.path.join(tmp, "gh.log")
+            open(log, "w").close()
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""),
-                       FAKE_MERGE_STATUS=str(status))
+                       FAKE_MERGE_STATUS=str(status), FAKE_GH_LOG=log,
+                       GITOPS_GH_TOKEN_CMD=mint,
+                       GH_TOKEN="personal-login-token")  # must NOT be used
             proc = subprocess.run(
                 [sys.executable, os.path.join(here, "merge_decision.py"),
                  "--repo", "learhy/x", "--pr", "7", "--merge"],
                 capture_output=True, text=True, env=env, cwd=here, timeout=60,
             )
+            self.gh_tokens = open(log).read().split()
         self.assertNotIn("Traceback", proc.stderr)
         lines = [_json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
         return proc.returncode, lines
+
+    def test_every_gh_call_uses_the_app_token(self):
+        # 2026-11-02: PR #260 was merged by the gate on Dan's personal login
+        # because the App token didn't reach the gate's shell.
+        self.run_cli(405)
+        self.assertTrue(self.gh_tokens)
+        self.assertEqual(set(self.gh_tokens), {"app-token-123"})
+
+    def test_token_mint_failure_holds_without_calling_gh(self):
+        code, lines = self.run_cli(405, token_script="#!/bin/sh\necho no pem >&2\nexit 1\n")
+        self.assertEqual(code, 2)
+        self.assertEqual(lines[-1]["decision"], "HOLD")
+        self.assertIn("GitHub App token", lines[-1]["reason"])
+        self.assertEqual(self.gh_tokens, [])
 
     def test_rejections_print_hold(self):
         for status in (403, 405, 409, 422):

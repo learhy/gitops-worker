@@ -61,12 +61,53 @@ def strip_proxy_env() -> Dict[str, str]:
     return {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
 
 
+# Every gh call here runs as the GitHub App (project-stdio-orchestrator),
+# never as whatever login the host's gh has stored. The worker's
+# `eval "$(gh-app-token.sh --export)"` does not survive into a separate
+# shell, so on 2026-11-02 the gate's merge of PR #260 ran on Dan's personal
+# (admin) login. The token is minted here, per process, and a failure to
+# mint is a HOLD, never a fallback.
+TOKEN_CMD_ENV = "GITOPS_GH_TOKEN_CMD"
+DEFAULT_TOKEN_CMD = "~/bin/gh-app-token.sh"
+_app_token_cache: Dict[str, str] = {}
+
+
+def app_token() -> str:
+    """The App installation token, from gh-app-token.sh (prints the token)."""
+    if "token" in _app_token_cache:
+        return _app_token_cache["token"]
+    cmd = os.path.expanduser(os.environ.get(TOKEN_CMD_ENV, DEFAULT_TOKEN_CMD))
+    try:
+        proc = subprocess.run([cmd], capture_output=True, text=True, timeout=60,
+                              env=strip_proxy_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GithubStateError("could not mint the GitHub App token with %s: %s" % (cmd, exc)) from exc
+    token = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not token:
+        raise GithubStateError(
+            "could not mint the GitHub App token with %s (exit %s): %s"
+            % (cmd, proc.returncode, (proc.stderr or "").strip()[:300])
+        )
+    _app_token_cache["token"] = token
+    return token
+
+
+def gh_env() -> Dict[str, str]:
+    """Environment for gh: no proxies, and the App token as the only credential."""
+    env = strip_proxy_env()
+    token = app_token()
+    env["GH_TOKEN"] = token
+    env["GITHUB_TOKEN"] = token
+    env.pop("GH_ENTERPRISE_TOKEN", None)
+    return env
+
+
 def default_runner(args: List[str]) -> Dict:
     """Run ``gh api`` and return the parsed JSON body."""
     cmd = ["gh", "api"] + args
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=90, env=strip_proxy_env(),
+            cmd, capture_output=True, text=True, timeout=90, env=gh_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GithubStateError("gh api failed: %s" % exc) from exc
@@ -184,7 +225,7 @@ class GhMergeClient:
             "-f", "sha=%s" % expected_head_sha,  # GitHub's expected-head-SHA field
         ]
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=90, env=strip_proxy_env(),
+            cmd, capture_output=True, text=True, timeout=90, env=gh_env(),
         )
         if proc.returncode == 0:
             return json.loads(proc.stdout or "{}")

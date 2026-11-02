@@ -184,7 +184,7 @@ def _classified_holds(state: Dict):
     if not _learhy_released(state):
         for issue in state.get("linked_issues", []):
             if DO_NOT_MERGE_RE.search(issue.get("body") or ""):
-                review.append("do-not-merge in #%s body, not released" % issue["number"])
+                review.append("do-not-merge in #%s body (review hold)" % issue["number"])
 
     # 2b. "do not merge" in a learhy comment on the PR or a linked issue,
     #     unless a later learhy comment releases it.
@@ -307,7 +307,19 @@ def _all_labels(state: Dict) -> List[str]:
 
 def build_audit_line(state: Dict, decision: str, reason: str,
                      approval_sha: Optional[str]) -> str:
-    """One-line audit record: labels, hold signals, approval SHA, decision."""
+    """One-line audit record: labels, hold signals, approval SHA, decision.
+
+    Review holds (hold labels, 'do not merge' in an issue body) are listed
+    as released when a learhy approval on the head lifted them, so a MERGE
+    line never shows a hold that still looks binding.
+    """
+    review, absolute = _classified_holds(state)
+    if approval_sha and not absolute:
+        released = ["%s, released by learhy approval on %s" % (h, _short(approval_sha))
+                    for h in review]
+        holds = released
+    else:
+        holds = review + absolute
     return _one_line(
         "merge-audit PR #{n} decision={dec} head={head} approval={appr} "
         "labels=[{labels}] holds=[{holds}] reason={reason}".format(
@@ -316,7 +328,7 @@ def build_audit_line(state: Dict, decision: str, reason: str,
             head=_short(state.get("head_sha")),
             appr=_short(approval_sha) if approval_sha else "none",
             labels=", ".join(_all_labels(state)),
-            holds="; ".join(_hold_signals(state)) or "none",
+            holds="; ".join(holds) or "none",
             reason=reason,
         )
     )

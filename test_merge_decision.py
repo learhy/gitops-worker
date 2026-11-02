@@ -796,5 +796,33 @@ class ApprovalCarryOver(unittest.TestCase):
         self.assertFalse([c for c in calls if "/compare/" in c])
 
 
+class AuditWording(unittest.TestCase):
+    """2026-11-02: a MERGE audit line listed 'do-not-merge in #242 body, not
+    released' next to decision=MERGE, which read as a bypass. Lifted review
+    holds now say what lifted them."""
+
+    def test_merge_line_says_what_released_the_holds(self):
+        state = make_state(
+            linked_issues=[issue(number=242, body=COPY_REVIEW_BODY,
+                                 labels=["agent:cole", "copy-review", "methods"])],
+            pr_reviews=[review(LEARNY, "APPROVED", HEAD, iso(11, 50))],
+        )
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "MERGE")
+        line = decision["audit_line"]
+        self.assertNotIn("not released", line)
+        self.assertIn("do-not-merge in #242 body (review hold), released by learhy approval on %s"
+                      % HEAD[:12], line)
+        self.assertIn("methods label on #242, released by learhy approval", line)
+
+    def test_hold_line_keeps_holds_plain(self):
+        state = make_state(linked_issues=[issue(number=242, body=COPY_REVIEW_BODY,
+                                                labels=["agent:cole", "methods"])])
+        line = decide_merge(state)["audit_line"]
+        self.assertIn("decision=HOLD", line)
+        self.assertNotIn("released by", line)
+        self.assertIn("do-not-merge in #242 body (review hold)", line)
+
+
 if __name__ == "__main__":
     unittest.main()

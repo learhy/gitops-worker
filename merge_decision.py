@@ -18,23 +18,32 @@ Three parts:
 
 - ``perform_merge(client, repo, pr, expected_head_sha)`` — performs the merge
   with head-SHA protection so a push between check and merge cannot slip
-  through. A GitHub-side rejection (405/403, e.g. branch protection) maps to
-  HOLD: post the held comment and wait. NEVER bypass, retry or use admin.
+  through. A GitHub-side rejection (403/405/409/422, e.g. branch protection
+  or the head moved) maps to HOLD: post the held comment and wait. NEVER
+  bypass, retry or use admin.
 
-Merge rule (Dan's change order, 2026-11-01):
+Merge rule (Dan's change order, 2026-11-01; review-lane amendments 2026-11-02):
 
   MERGE iff:
     1. No hold signal, where a hold signal is any of:
        - label ``cole:hold`` or ``methods`` on the PR or a linked issue
          (released by a learhy approval on the PR's CURRENT head SHA —
          that is how Claude's review approves methods-held PRs);
-       - "do not merge" (case-insensitive) in a linked issue's body, or in
-         any comment by learhy on the PR or a linked issue — unless a later
-         learhy comment says "release hold" or "ok to merge";
+       - "do not merge" / "don't merge" (case-insensitive) in a linked
+         issue's BODY. The automated reviews open every methods issue with
+         "**Do not merge.** Open the PR and stop. Claude will review it
+         before it merges." — a review hold, so it is released the same
+         way as the methods label: a learhy approval on the CURRENT head,
+         or a learhy "release hold" / "ok to merge" comment;
+       - "do not merge" in any COMMENT by learhy on the PR or a linked
+         issue — released ONLY by a later learhy comment saying "release
+         hold" or "ok to merge" (an approval does not release it: a hold
+         comment is a deliberate intervention, the #228 incident);
+         a negated release ("not ok to merge") releases nothing;
        - a CHANGES_REQUESTED review from learhy with no newer APPROVE
          from learhy.
     2. AND one of:
-       (a) ``cole:go-and-merge`` is on a linked issue right now, OR
+       (a) ``cole:go-and-merge`` is on EVERY linked issue right now, OR
        (b) learhy submitted an APPROVE review on the PR's CURRENT head SHA
            (an approval on an older commit does not count).
     3. AND ``mergeable_state`` is ``clean`` and no check run has failed.
@@ -58,14 +67,18 @@ import sys
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
-from github_state import fetch_state, GhMergeClient, GithubStateError  # noqa: F401 (CLI use)
+from github_state import (  # noqa: F401 (CLI use; MergeRejected re-exported)
+    fetch_state, GhMergeClient, GithubStateError, MergeRejected,
+)
 
 HOLD_LABELS = ("cole:hold", "methods")
 GO_LABEL = "cole:go-and-merge"
 AUTHORITY = "learhy"  # the only user whose comments/reviews carry hold/release signals
 
-DO_NOT_MERGE_RE = re.compile(r"do\s*not\s*merge", re.IGNORECASE)
-RELEASE_RE = re.compile(r"release\s+hold|ok\s+to\s+merge", re.IGNORECASE)
+DO_NOT_MERGE_RE = re.compile(r"\b(?:do\s*not|don['’]?t|do-not)[\s-]*merge", re.IGNORECASE)
+RELEASE_RE = re.compile(r"release\s+(?:the\s+)?hold|ok(?:ay)?\s+to\s+merge", re.IGNORECASE)
+# A release phrase preceded by one of these is not a release ("not ok to merge").
+NEGATION_RE = re.compile(r"(?:\bnot|\bnever|\bno|n['’]t)\s*(?:yet\s+)?$", re.IGNORECASE)
 
 FAILED_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 
@@ -89,13 +102,12 @@ FAILED_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required", "s
 # --------------------------------------------------------------------------
 
 
-class MergeRejected(Exception):
-    """GitHub refused the merge call (e.g. protected branch / code-owner rule)."""
-
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
+def is_release(text: str) -> bool:
+    """True if ``text`` contains a release phrase that isn't negated."""
+    for match in RELEASE_RE.finditer(text or ""):
+        if not NEGATION_RE.search((text or "")[max(0, match.start() - 24):match.start()]):
+            return True
+    return False
 
 
 def _short(sha: Optional[str]) -> str:
@@ -127,31 +139,47 @@ def _collect_learhy_comment_events(state: Dict) -> List[tuple]:
     return events
 
 
-def _dnm_in_body(state: Dict) -> Optional[str]:
-    """Where a linked issue *body* says 'do not merge' (any author)."""
-    for issue in state.get("linked_issues", []):
-        if DO_NOT_MERGE_RE.search(issue.get("body") or ""):
-            return "#%s" % issue["number"]
-    return None
+def _learhy_released(state: Dict) -> bool:
+    """True if any learhy comment (PR or linked issue) is a non-negated
+    release that doesn't itself re-assert 'do not merge'."""
+    for _ts, _where, comment in _collect_learhy_comment_events(state):
+        if comment.get("author") != AUTHORITY:
+            continue
+        body = comment.get("body") or ""
+        if is_release(body) and not DO_NOT_MERGE_RE.search(body):
+            return True
+    return False
 
 
-def _hold_signals(state: Dict) -> List[str]:
-    """Every hold signal present in the freshly-fetched state."""
-    holds: List[str] = []
+def _classified_holds(state: Dict):
+    """Hold signals in the freshly-fetched state, split by how they release.
+
+    Returns (review_holds, absolute_holds):
+      - review holds (hold labels, 'do not merge' in a linked issue body):
+        released by a learhy APPROVE on the current head SHA;
+      - absolute holds (unreleased learhy 'do not merge' comment,
+        CHANGES_REQUESTED): an approval does not release them.
+    """
+    review: List[str] = []
+    absolute: List[str] = []
 
     # 1. Hold labels on the PR or any linked issue.
     for label in HOLD_LABELS:
         if label in (state.get("pr_labels") or []):
-            holds.append("%s label on PR #%s" % (label, state["pr_number"]))
+            review.append("%s label on PR #%s" % (label, state["pr_number"]))
     for issue in state.get("linked_issues", []):
         for label in HOLD_LABELS:
             if label in (issue.get("labels") or []):
-                holds.append("%s label on #%s" % (label, issue["number"]))
+                review.append("%s label on #%s" % (label, issue["number"]))
 
-    # 2. "do not merge" in a linked issue body (any author).
-    where = _dnm_in_body(state)
-    if where:
-        holds.append("do-not-merge in %s body, not released" % where)
+    # 2. "do not merge" in a linked issue body (any author). The automated
+    #    reviews write it into every methods issue as a review hold; a
+    #    learhy release comment clears it outright, an approval clears it
+    #    in decide_merge.
+    if not _learhy_released(state):
+        for issue in state.get("linked_issues", []):
+            if DO_NOT_MERGE_RE.search(issue.get("body") or ""):
+                review.append("do-not-merge in #%s body, not released" % issue["number"])
 
     # 2b. "do not merge" in a learhy comment on the PR or a linked issue,
     #     unless a later learhy comment releases it.
@@ -162,25 +190,31 @@ def _hold_signals(state: Dict) -> List[str]:
         body = comment.get("body") or ""
         if DO_NOT_MERGE_RE.search(body):
             last_dnm = where  # a re-assertion re-arms the hold
-        elif RELEASE_RE.search(body) and last_dnm is not None:
+        elif is_release(body) and last_dnm is not None:
             last_dnm = None  # released
     if last_dnm:
-        holds.append("do-not-merge from learhy on %s, not released" % last_dnm)
+        absolute.append("do-not-merge from learhy on %s, not released" % last_dnm)
 
     # 3. CHANGES_REQUESTED from learhy with no newer APPROVE from learhy.
     latest = None
-    for review in state.get("pr_reviews", []):
-        if review.get("author") != AUTHORITY:
+    for review_ in state.get("pr_reviews", []):
+        if review_.get("author") != AUTHORITY:
             continue
-        if review.get("state") not in ("APPROVED", "CHANGES_REQUESTED"):
+        if review_.get("state") not in ("APPROVED", "CHANGES_REQUESTED"):
             continue
-        key = (review.get("submitted_at") or "", review.get("state"))
+        key = (review_.get("submitted_at") or "", review_.get("state"))
         if latest is None or key >= (latest.get("submitted_at") or "", latest.get("state")):
-            latest = review
+            latest = review_
     if latest and latest.get("state") == "CHANGES_REQUESTED":
-        holds.append("learhy CHANGES_REQUESTED with no newer learhy approval")
+        absolute.append("learhy CHANGES_REQUESTED with no newer learhy approval")
 
-    return holds
+    return review, absolute
+
+
+def _hold_signals(state: Dict) -> List[str]:
+    """Every hold signal present in the freshly-fetched state."""
+    review, absolute = _classified_holds(state)
+    return review + absolute
 
 
 def _current_head_approval(state: Dict, head_sha: str) -> Optional[str]:
@@ -252,28 +286,29 @@ def decide_merge(state: Dict) -> Dict:
     """Pure merge-rights decision from fresh, structured GitHub state."""
     head = state.get("head_sha") or ""
     approval_sha = _current_head_approval(state, head)
-    holds = _hold_signals(state)
-    label_holds = [h for h in holds if h.split()[0] in HOLD_LABELS]
-    other_holds = [h for h in holds if h not in label_holds]
-    go_label = any(
-        GO_LABEL in (issue.get("labels") or [])
-        for issue in state.get("linked_issues", [])
+    review_holds, absolute_holds = _classified_holds(state)
+    linked = state.get("linked_issues", [])
+    # go-and-merge authorizes only if EVERY linked issue carries it: a PR
+    # that also closes a plain-"go" issue must not ride another issue's label.
+    go_label = bool(linked) and all(
+        GO_LABEL in (issue.get("labels") or []) for issue in linked
     )
 
-    # 1. Absolute holds: unreleased do-not-merge / changes-requested.
-    if other_holds:
-        return _decision(state, "HOLD", other_holds[0], approval_sha)
+    # 1. Absolute holds: unreleased learhy do-not-merge / changes-requested.
+    if absolute_holds:
+        return _decision(state, "HOLD", absolute_holds[0], approval_sha)
 
-    # 2. Hold labels block path (a); path (b) — a learhy approval on the
-    #    current head — is their release.
-    if label_holds and approval_sha is None:
-        return _decision(state, "HOLD", label_holds[0], approval_sha)
+    # 2. Review holds (hold labels, do-not-merge in an issue body) block
+    #    path (a); path (b), a learhy approval on the current head, is
+    #    their release.
+    if review_holds and approval_sha is None:
+        return _decision(state, "HOLD", review_holds[0], approval_sha)
 
     # 3. Authorization: go-and-merge label now, or current-head approval.
     if not (go_label or approval_sha):
         return _decision(
             state, "HOLD",
-            "no cole:go-and-merge on linked issue and no learhy approval on head %s"
+            "no cole:go-and-merge on every linked issue and no learhy approval on head %s"
             % _short(head),
             approval_sha,
         )
@@ -353,8 +388,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(json.dumps(result))
 
     if args.merge and result["decision"] == "MERGE":
-        from github_state import GhMergeClient
-        outcome = perform_merge(GhMergeClient(), args.repo, args.pr, result["head_sha"])
+        try:
+            outcome = perform_merge(GhMergeClient(), args.repo, args.pr, result["head_sha"])
+        except Exception as exc:  # noqa: BLE001 — an unexpected error must not look like a merge
+            reason = ("merge call errored, merge state unknown; re-read the PR before "
+                      "doing anything else: %s" % _one_line(str(exc)))
+            outcome = {"merged": False, "decision": "HOLD", "reason": reason,
+                       "held_comment": held_comment(reason)}
+            print(json.dumps(outcome))
+            return 2
         print(json.dumps(outcome))
         return 0 if outcome["merged"] else 1
 

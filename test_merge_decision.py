@@ -374,5 +374,202 @@ class GithubStateParsing(unittest.TestCase):
         self.assertEqual(decide_merge(state)["decision"], "HOLD")  # methods + no approval
 
 
+COPY_REVIEW_BODY = (
+    "**Do not merge.** Open the PR and stop. Claude will review it before it merges.\n\n"
+    "**Priority:** Top-3\n\n**Location:** National Pulse..."
+)
+
+
+class ReviewLaneMethodsIssue(unittest.TestCase):
+    """2026-11-02: methods issues from the automated reviews build without a
+    'go' and merge once learhy (Claude's review) approves the current head.
+    Their bodies open with 'Do not merge.', a review hold."""
+
+    def methods_state(self, **overrides):
+        base = dict(linked_issues=[issue(number=250, body=COPY_REVIEW_BODY,
+                                         labels=["agent:cole", "copy-review", "methods"])])
+        base.update(overrides)
+        return make_state(**base)
+
+    def test_holds_before_review(self):
+        decision = decide_merge(self.methods_state())
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("methods label on #250", decision["reason"])
+        self.assertIn("do-not-merge in #250 body", decision["audit_line"])
+
+    def test_approval_on_current_head_merges(self):
+        state = self.methods_state(pr_reviews=[review(LEARNY, "APPROVED", HEAD, iso(10, 0))])
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "MERGE")
+        self.assertIn("learhy approval on head", decision["reason"])
+
+    def test_approval_on_older_head_still_holds(self):
+        state = self.methods_state(head_sha=NEW_SHA,
+                                   pr_reviews=[review(LEARNY, "APPROVED", OLD_SHA, iso(10, 0))])
+        self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_approval_does_not_release_a_hold_comment(self):
+        # A learhy "do not merge" comment is a deliberate intervention: only a
+        # release comment clears it, not an approval.
+        state = self.methods_state(
+            pr_comments=[comment(LEARNY, "Hold: do not merge, numbers are off", iso(9, 0))],
+            pr_reviews=[review(LEARNY, "APPROVED", HEAD, iso(10, 0))],
+        )
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("do-not-merge from learhy on PR #228", decision["reason"])
+
+    def test_body_dnm_released_by_release_comment_with_go_label(self):
+        state = make_state(linked_issues=[issue(
+            body="Do not merge until the Q3 data lands.",
+            labels=["agent:cole", "cole:go-and-merge"],
+            comments=[comment(LEARNY, "Q3 data is in, release hold", iso(10, 0))],
+        )])
+        self.assertEqual(decide_merge(state)["decision"], "MERGE")
+
+    def test_body_dnm_without_release_or_approval_holds(self):
+        state = make_state(linked_issues=[issue(body="Don't merge this before Friday",
+                                                labels=["agent:cole", "cole:go-and-merge"])])
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("body", decision["reason"])
+
+
+class ReleasePhrases(unittest.TestCase):
+    def test_negated_release_does_not_release(self):
+        state = make_state(pr_comments=[
+            comment(LEARNY, "do not merge", iso(7, 0)),
+            comment(LEARNY, "This is not ok to merge yet, the 2036 numbers are off", iso(8, 0)),
+        ])
+        self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_is_release(self):
+        self.assertTrue(merge_decision.is_release("ok to merge"))
+        self.assertTrue(merge_decision.is_release("Looks right now. Okay to merge."))
+        self.assertTrue(merge_decision.is_release("release the hold"))
+        self.assertFalse(merge_decision.is_release("not ok to merge"))
+        self.assertFalse(merge_decision.is_release("it isn't ok to merge"))
+        self.assertFalse(merge_decision.is_release("don't release hold yet"))
+        self.assertFalse(merge_decision.is_release("never okay to merge on red CI"))
+
+    def test_dont_merge_variants_hold(self):
+        for text in ("don't merge", "Dont merge yet", "do-not-merge", "DO NOT MERGE",
+                     "don’t merge"):
+            state = make_state(pr_comments=[comment(LEARNY, text, iso(7, 0))])
+            self.assertEqual(decide_merge(state)["decision"], "HOLD", text)
+
+
+class MultiIssuePrs(unittest.TestCase):
+    def test_go_label_must_be_on_every_linked_issue(self):
+        state = make_state(linked_issues=[
+            issue(number=255, labels=["agent:cole", "cole:go-and-merge"]),
+            issue(number=300, labels=["agent:cole"]),  # plain "go": Dan merges
+        ])
+        decision = decide_merge(state)
+        self.assertEqual(decision["decision"], "HOLD")
+        self.assertIn("every linked issue", decision["reason"])
+
+    def test_methods_on_second_issue_holds(self):
+        state = make_state(linked_issues=[
+            issue(number=255, labels=["agent:cole", "cole:go-and-merge"]),
+            issue(number=257, labels=["agent:cole", "cole:go-and-merge", "methods"]),
+        ])
+        self.assertEqual(decide_merge(state)["decision"], "HOLD")
+
+    def test_parse_closing_keyword_lists(self):
+        parse = github_state.parse_linked_issues
+        self.assertEqual(parse("Closes #241, #245 and #250"), [241, 245, 250])
+        self.assertEqual(parse("Fixes #1 & #2, closes #3"), [1, 2, 3])
+        self.assertEqual(parse("Closes #241, see also #999"), [241])
+
+
+class MergeableStateRetry(unittest.TestCase):
+    def test_unknown_mergeable_state_is_reread(self):
+        reads = {"n": 0}
+        sleeps = []
+
+        def runner(args):
+            path = args[0]
+            if path == "repos/learhy/x/pulls/228":
+                reads["n"] += 1
+                state = "unknown" if reads["n"] == 1 else "clean"
+                return {"head": {"sha": HEAD}, "body": "Closes #221", "labels": [],
+                        "mergeable_state": state}
+            if "check-runs" in path:
+                return {"check_runs": []}
+            if path == "repos/learhy/x/issues/221":
+                return {"body": "work", "labels": [{"name": "cole:go-and-merge"}]}
+            return []
+
+        state = github_state.fetch_state("learhy/x", 228, runner=runner,
+                                         sleep=lambda s: sleeps.append(s))
+        self.assertEqual(state["mergeable_state"], "clean")
+        self.assertEqual(reads["n"], 2)
+        self.assertEqual(len(sleeps), 1)
+
+
+class CliRejectionPath(unittest.TestCase):
+    """Regression: run as a script, merge_decision is __main__, and the old
+    github_state raised merge_decision.MergeRejected from a SECOND import of
+    the module, so `except MergeRejected` missed it and the CLI died with a
+    traceback instead of printing HOLD. Exercise the real CLI with a fake gh."""
+
+    FAKE_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+a = sys.argv[1:]
+if "--method" in a:
+    sys.stderr.write("gh: %s (HTTP %s)\n" % ("refused", os.environ["FAKE_MERGE_STATUS"]))
+    sys.exit(1)
+p = a[1]
+if p.endswith("/pulls/7"):
+    print(json.dumps({"head": {"sha": "a" * 40}, "body": "Closes #3", "labels": [],
+                      "mergeable_state": "clean"}))
+elif "/check-runs" in p:
+    print(json.dumps({"check_runs": []}))
+elif p.endswith("/issues/3"):
+    print(json.dumps({"body": "fix a typo", "labels": [{"name": "cole:go-and-merge"}]}))
+else:
+    print("[]")
+'''
+
+    def run_cli(self, status):
+        import json as _json
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = os.path.join(tmp, "gh")
+            with open(gh, "w") as fh:
+                fh.write(self.FAKE_GH)
+            os.chmod(gh, 0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""),
+                       FAKE_MERGE_STATUS=str(status))
+            proc = subprocess.run(
+                [sys.executable, os.path.join(here, "merge_decision.py"),
+                 "--repo", "learhy/x", "--pr", "7", "--merge"],
+                capture_output=True, text=True, env=env, cwd=here, timeout=60,
+            )
+        self.assertNotIn("Traceback", proc.stderr)
+        lines = [_json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+        return proc.returncode, lines
+
+    def test_rejections_print_hold(self):
+        for status in (403, 405, 409, 422):
+            code, lines = self.run_cli(status)
+            self.assertEqual(lines[0]["decision"], "MERGE")  # the gate allowed it
+            self.assertEqual(lines[-1]["decision"], "HOLD", status)
+            self.assertFalse(lines[-1]["merged"])
+            self.assertIn("Held for review.", lines[-1]["held_comment"])
+            self.assertEqual(code, 1)
+
+    def test_other_errors_print_hold_not_traceback(self):
+        code, lines = self.run_cli(500)
+        self.assertEqual(lines[-1]["decision"], "HOLD")
+        self.assertIn("merge state unknown", lines[-1]["reason"])
+        self.assertEqual(code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

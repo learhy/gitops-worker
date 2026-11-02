@@ -6,6 +6,7 @@ GitHub issues in, PRs out, auto-deploy on merge.
 Files here are the live sources:
 - `gitops-worker-prompt.md` — the worker's prompt (deployed via `hermes cron edit`)
 - `merge_decision.py` — the merge-decision gate: decides merge rights at merge time from fresh GitHub state (HOLD/MERGE + one-line audit record); `--merge` executes the merge with expected-head-SHA protection and maps a GitHub-side rejection to HOLD
+  - Lanes: `cole:go-and-merge` builds and merges on sight; an issue with `agent:cole` + `methods` builds on sight (no "go" needed) and merges only after learhy approves the PR's current head (Claude's review); everything else waits for Dan's "go". Add `cole:hold` to keep a methods issue in plan mode.
 - `github_state.py` — fetches that fresh state via `gh api` and shapes it for the gate
 - `test_merge_decision.py` — unit tests for the gate (in-memory GitHub state, incl. the #221/#228 incident replay)
 - `gitops-github-filter.py` — webhook payload filter (routes label/comment/push events)

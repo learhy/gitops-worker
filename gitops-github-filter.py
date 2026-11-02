@@ -9,6 +9,10 @@ Conventions:
   - @cole mention (issue body or comment body)     -> directive "discuss":
     engage in discussion — think through ideas, give advice, answer questions.
     Works with or without the agent:cole label. Never labels, never plans, never opens PRs.
+  - issue carrying both "agent:cole" and "methods" (opened, labeled or
+    reopened), unless "cole:hold" is on it         -> instruction "build-for-review":
+    build the PR without waiting for a "go"; the merge gate holds it until
+    learhy approves the PR's current head (Claude's review)
   - issues.labeled with label "agent:cole"         -> instruction "plan"
   - issue_comment.created on an issue labeled "agent:cole":
       body == go / 👍 / lgtm / ship it             -> instruction "execute"
@@ -24,6 +28,8 @@ REPOS_FILE = os.path.expanduser("~/.hermes/data/gitops-repos.txt")
 DEPLOY_FILE = os.path.expanduser("~/.hermes/data/gitops-deploy.json")
 WORK_LABEL = "agent:cole"
 GAM_LABEL = "cole:go-and-merge"
+REVIEW_LABEL = "methods"   # built on sight, merged only after learhy approval
+HOLD_LABEL = "cole:hold"   # keeps a methods issue in plan/discuss mode
 GO_RE = re.compile(r"^\s*(go( and merge|-and-merge)?|👍|lgtm|ship it)\s*[.!]*\s*$", re.IGNORECASE)
 GAM_BODY_RE = re.compile(r"\bgo-and-merge\b|\bgo and merge\b", re.IGNORECASE)
 MENTION_RE = re.compile(r"@(cole|project-stdio-orchestrator)\b", re.IGNORECASE)
@@ -55,6 +61,13 @@ if "issue" in payload and "comment" not in payload:  # issues event
         sys.exit(0)
     if action in ("opened", "edited") and (GAM_LABEL in labels or GAM_BODY_RE.search(body)):
         out["hermes_instruction"] = "execute-merge"
+        print(json.dumps(out))
+        sys.exit(0)
+    # agent:cole + methods = build-for-review lane: build on sight, no "go"
+    # needed; the merge gate holds the PR until learhy approves its head.
+    if (action in ("opened", "labeled", "reopened")
+            and WORK_LABEL in labels and REVIEW_LABEL in labels and HOLD_LABEL not in labels):
+        out["hermes_instruction"] = "build-for-review"
         print(json.dumps(out))
         sys.exit(0)
     if action == "labeled" and payload.get("label", {}).get("name") == WORK_LABEL:

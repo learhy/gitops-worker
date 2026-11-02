@@ -12,14 +12,24 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List
 
 # Closes / closes / fix / fixes / fixed / resolves / resolved — with issue refs.
+# A keyword may carry a list: "Closes #241, #245 and #250" links all three
+# (a consolidated PR must not hide the hold labels of its later issues).
 LINKED_ISSUE_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolv(?:e[sd])?)\s*:?\s*#(\d+)",
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolv(?:e[sd])?)\s*:?\s*"
+    r"(#\d+(?:\s*(?:,\s*(?:and\s+)?|and\s+|&\s*)#\d+)*)",
     re.IGNORECASE,
 )
+ISSUE_NUMBER_RE = re.compile(r"#(\d+)")
+
+# GitHub computes mergeable_state lazily: the first read after a push often
+# says "unknown". Re-read the PR a few times before deciding on it.
+MERGEABLE_RETRIES = 3
+MERGEABLE_RETRY_SECONDS = 3
 
 CHECK_RUNS_PER_PAGE = 100
 COMMENTS_PER_PAGE = 100
@@ -27,6 +37,23 @@ COMMENTS_PER_PAGE = 100
 
 class GithubStateError(Exception):
     """A fresh-state fetch failed. The caller must treat this as 'do not merge'."""
+
+
+class MergeRejected(Exception):
+    """GitHub refused the merge call (protected branch, code-owner rule,
+    head moved since the check, not mergeable). Always maps to HOLD.
+
+    Defined here, not in merge_decision, so the class raised by
+    GhMergeClient is the same object merge_decision catches. (When
+    merge_decision.py runs as a script it is ``__main__``; importing
+    ``merge_decision`` from here created a second, different class and the
+    rejection escaped as a traceback.)
+    """
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
 def strip_proxy_env() -> Dict[str, str]:
@@ -58,10 +85,11 @@ def parse_linked_issues(pr_body: str) -> List[int]:
     """Issue numbers referenced by closing keywords in the PR body."""
     seen, ordered = set(), []
     for match in LINKED_ISSUE_RE.finditer(pr_body or ""):
-        number = int(match.group(1))
-        if number not in seen:
-            seen.add(number)
-            ordered.append(number)
+        for ref in ISSUE_NUMBER_RE.findall(match.group(1)):
+            number = int(ref)
+            if number not in seen:
+                seen.add(number)
+                ordered.append(number)
     return ordered
 
 
@@ -82,13 +110,19 @@ def _review(r: Dict) -> Dict:
     }
 
 
-def fetch_state(repo: str, pr_number: int, runner: Callable = default_runner) -> Dict:
+def fetch_state(repo: str, pr_number: int, runner: Callable = default_runner,
+                sleep: Callable = time.sleep) -> Dict:
     """Fetch PR + linked-issue state fresh from GitHub, shaped for decide_merge.
 
     Raises GithubStateError on any failure — callers must treat that as HOLD.
     """
     try:
         pr = runner(["repos/%s/pulls/%d" % (repo, pr_number)])
+        for _ in range(MERGEABLE_RETRIES):
+            if (pr.get("mergeable_state") or "unknown") != "unknown":
+                break
+            sleep(MERGEABLE_RETRY_SECONDS)
+            pr = runner(["repos/%s/pulls/%d" % (repo, pr_number)])
         pr_comments = runner([
             "repos/%s/issues/%d/comments?per_page=%d" % (repo, pr_number, COMMENTS_PER_PAGE),
         ]) or []
@@ -133,8 +167,14 @@ def fetch_state(repo: str, pr_number: int, runner: Callable = default_runner) ->
     }
 
 
+# 403 forbidden (branch rules), 405 not mergeable / protected branch,
+# 409 head moved since the check (expected-head-SHA mismatch),
+# 422 validation failed (e.g. not mergeable right now).
+REJECT_STATUSES = (403, 405, 409, 422)
+
+
 class GhMergeClient:
-    """Merge client backed by ``gh api``. Raises MergeRejected on 405/403."""
+    """Merge client backed by ``gh api``. Raises MergeRejected on a refusal."""
 
     def merge(self, repo: str, pr_number: int, expected_head_sha: str) -> Dict:
         cmd = [
@@ -151,10 +191,8 @@ class GhMergeClient:
         stderr = (proc.stderr or "").strip()
         status_match = re.search(r"HTTP (\d{3})", stderr)
         status = int(status_match.group(1)) if status_match else 0
-        if status in (403, 405):
-            # 405: not mergeable / protected branch; 403: forbidden (branch rules).
-            import merge_decision
-            raise merge_decision.MergeRejected(status, stderr[:400])
+        if status in REJECT_STATUSES:
+            raise MergeRejected(status, stderr[:400])
         raise GithubStateError(
             "merge call failed (HTTP %s): %s" % (status or proc.returncode, stderr[:400])
         )

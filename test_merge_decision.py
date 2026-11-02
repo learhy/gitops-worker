@@ -563,7 +563,15 @@ if os.environ.get("GH_TOKEN") != "app-token-123":
     sys.exit(1)
 a = sys.argv[1:]
 if "--method" in a:
-    sys.stderr.write("gh: %s (HTTP %s)\n" % ("refused", os.environ["FAKE_MERGE_STATUS"]))
+    method = a[a.index("--method") + 1]
+    if method != "PUT":  # like GitHub: the merge endpoint only answers PUT
+        sys.stderr.write("gh: Not Found (HTTP 404)\n")
+        sys.exit(1)
+    status = os.environ["FAKE_MERGE_STATUS"]
+    if status == "200":
+        print(json.dumps({"sha": "m" * 40, "merged": True, "message": "Pull Request successfully merged"}))
+        sys.exit(0)
+    sys.stderr.write("gh: %s (HTTP %s)\n" % ("refused", status))
     sys.exit(1)
 p = a[1]
 if p.endswith("/pulls/7"):
@@ -631,6 +639,13 @@ else:
             self.assertFalse(lines[-1]["merged"])
             self.assertIn("Held for review.", lines[-1]["held_comment"])
             self.assertEqual(code, 1)
+
+    def test_successful_merge_uses_put(self):
+        # 2026-11-02: the gate sent POST, GitHub answered 404 on every merge.
+        code, lines = self.run_cli(200)
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[-1]["decision"], "MERGE")
+        self.assertTrue(lines[-1]["merged"])
 
     def test_other_errors_print_hold_not_traceback(self):
         code, lines = self.run_cli(500)

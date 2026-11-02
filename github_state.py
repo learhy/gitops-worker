@@ -285,7 +285,9 @@ class GhMergeClient:
 
     def merge(self, repo: str, pr_number: int, expected_head_sha: str) -> Dict:
         cmd = [
-            "gh", "api", "--method", "POST",
+            # GitHub's merge endpoint is PUT; a POST to it returns 404 Not
+            # Found, which on 2026-11-02 read like a missing App permission.
+            "gh", "api", "--method", "PUT",
             "repos/%s/pulls/%d/merge" % (repo, pr_number),
             "-f", "merge_method=merge",
             "-f", "sha=%s" % expected_head_sha,  # GitHub's expected-head-SHA field

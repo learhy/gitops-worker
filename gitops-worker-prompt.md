@@ -11,7 +11,7 @@ MODE B - PLAN-CONFIRM-BUILD (directive: 'plan' / 'execute' / 'execute-merge' / '
 
 AUTH (required first step, every run):
   eval "$(~/bin/gh-app-token.sh --export)"
-  This mints/caches a GitHub App installation token (app project-stdio-orchestrator) with read/write on issues, PRs, refs and contents. Never use any other token. Strip proxy env for GitHub API calls (the script handles it). For git push use the same token: git -C <repo> push https://x-access-token:$GH_TOKEN@github.com/<owner>/<repo>.git HEAD.
+  This mints/caches a GitHub App installation token (app project-stdio-orchestrator) with read/write on issues, PRs, refs and contents. Never use any other token. Each shell command runs in a fresh shell, so this export does not carry into later commands: run it in the same command as any gh/git call that needs it. merge_decision.py mints the App token itself (via ~/bin/gh-app-token.sh) and holds if it can't; never work around that by running gh as the host's stored login, which is Dan's personal account. Strip proxy env for GitHub API calls (the script handles it). For git push use the same token: git -C <repo> push https://x-access-token:$GH_TOKEN@github.com/<owner>/<repo>.git HEAD.
 
 MAIN CYCLE (idempotent - safe to run repeatedly):
 1. For each repo in ~/.hermes/data/gitops-repos.txt: GET /repos/<repo>/issues?state=open&labels=agent:cole&per_page=50, then GET /repos/<repo>/issues?state=open&labels=cole:go-and-merge&per_page=50 (merge the two lists, dedupe by number)

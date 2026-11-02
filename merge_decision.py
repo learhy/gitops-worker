@@ -83,7 +83,16 @@ NEGATION_RE = re.compile(r"(?:\bnot|\bnever|\bno|n['’]t)\s*(?:yet\s+)?$", re.I
 # Append-only logs every PR writes to. A merge from master moves an entry
 # within these files without changing it.
 LOG_FILES = ("CHANGELOG.md", "docs/DECISIONS.md")
+# Ignored entirely when carrying an approval: CHANGELOG.md is an internal log
+# no reader sees, and Cole rewords its own entry when resolving conflicts
+# (2026-11-02: four approved PRs lost their approval over that alone).
+# docs/DECISIONS.md stays strict: it is the methodology record.
+CARRY_IGNORED = ("CHANGELOG.md",)
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+# Cache-busting query tokens ("scenarios.js?v=20261102-pr290"). Every PR that
+# touches a script bumps the shared token, so the line it replaces changes each
+# time master moves; the token never changes what a reader sees.
+CACHE_BUST_RE = re.compile(r"\?v=[\w.-]+")
 
 FAILED_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 
@@ -241,7 +250,8 @@ def _current_head_approval(state: Dict, head_sha: str) -> Optional[str]:
 def _normalized_patch(patch: str) -> List[str]:
     """Patch lines with hunk line numbers stripped (they shift when master
     adds lines elsewhere in the same file; the change itself doesn't)."""
-    return [HUNK_HEADER_RE.sub("@@", line) for line in patch.splitlines()]
+    return [CACHE_BUST_RE.sub("?v=*", HUNK_HEADER_RE.sub("@@", line))
+            for line in patch.splitlines()]
 
 
 def _log_entry_lines(patch: str):
@@ -267,8 +277,10 @@ def conflict_only_update(carry: Optional[Dict]):
     if carry.get("ancestry_status") not in ("ahead", "identical"):
         return False, ("approval on %s not carried: it is not an ancestor of the head (%s)"
                        % (old_sha, carry.get("ancestry_status")))
-    old = {f["filename"]: f for f in carry.get("old_files") or []}
-    new = {f["filename"]: f for f in carry.get("new_files") or []}
+    old = {f["filename"]: f for f in carry.get("old_files") or []
+           if f.get("filename") not in CARRY_IGNORED}
+    new = {f["filename"]: f for f in carry.get("new_files") or []
+           if f.get("filename") not in CARRY_IGNORED}
     if not old:
         return False, "approval on %s not carried: no diff recorded for it" % old_sha
     if set(old) != set(new):

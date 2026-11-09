@@ -15,8 +15,13 @@ import glob
 import time
 import subprocess
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
-PT = timezone(timedelta(hours=-7))
+# DST-aware Pacific time. A hardcoded offset (-7) silently drifts by an hour
+# every time US daylight saving ends (first Sunday in November): the ledger
+# stamped 2026-11-01.. as PDT while the true local zone was PST, so every
+# sync-written line read an hour AHEAD of the run it described.
+PT = ZoneInfo("America/Los_Angeles")
 STATE_FILE = "/home/dan.rohan/mockup-previews/gitops/.ledger_state"
 LEDGER = "/home/dan.rohan/mockup-previews/gitops/runs.jsonl"
 JOB_ID = "f42f6ffda76b"

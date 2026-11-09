@@ -45,13 +45,14 @@ def db(tmp_path):
 
 @pytest.fixture
 def env(tmp_path):
-    """Temp ledger, temp state file, temp output dir."""
+    """Temp ledger, temp state file, temp pending sidecar, temp output dir."""
     ledger = tmp_path / "runs.jsonl"
     state = tmp_path / ".ledger_state"
+    pending = tmp_path / ".ledger_pending"
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    return {"ledger": str(ledger), "state": str(state), "out_dir": str(out_dir),
-            "tmp": tmp_path}
+    return {"ledger": str(ledger), "state": str(state), "pending": str(pending),
+            "out_dir": str(out_dir), "tmp": tmp_path}
 
 
 def add_row(conn, job_id="job1", started=None, finished=None, status="completed",
@@ -83,7 +84,8 @@ def read_ledger(path):
 def run_pass(db, env, state):
     """Run one sync pass against the temp paths; returns (lines, next_state)."""
     return sync.sync_pass(db, state, ledger=env["ledger"], state_path=env["state"],
-                           out_dir=env["out_dir"], job_id="job1")
+                           pending_path=env["pending"], out_dir=env["out_dir"],
+                           job_id="job1")
 
 
 # --- (a) a run first seen 'running' must still get its 'done' line ---------
@@ -94,7 +96,7 @@ def test_run_first_seen_running_gets_start_then_done(db, env):
     rowid = add_row(db, started=started, status="running")
     write_out(env["out_dir"], finished, "run finished cleanly")
 
-    lines, state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     assert [l["status"] for l in lines] == ["start"]
     assert state["seen_start"] == [rowid]
     # last_rowid must not advance past a row that never got a 'done' line
@@ -124,7 +126,7 @@ def test_run_still_running_across_passes_gets_one_start_only(db, env):
     started = "2026-11-08T18:30:36.042103-08:00"
     rowid = add_row(db, started=started, status="running")
 
-    lines, state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     assert [l["status"] for l in lines] == ["start"]
 
     lines2, state2 = run_pass(db, env, state)
@@ -147,7 +149,7 @@ def test_done_line_uses_its_own_output_file_not_the_newest(db, env):
     # a newer, unrelated run's file exists in the same directory
     write_out(env["out_dir"], "2026-11-08T20:05:00.000000-08:00", "SOMEONE ELSE'S OUTPUT")
 
-    lines, _state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     done = [l for l in lines if l["status"] == "done"]
     assert len(done) == 1
     assert done[0]["outcome"] == "THIS RUN'S OUTPUT"
@@ -161,7 +163,7 @@ def test_outcome_falls_back_to_nearest_file_within_window(db, env):
     write_out(env["out_dir"], "2026-11-08T19:37:34.564870-08:00", "NEARBY OUTPUT")
     write_out(env["out_dir"], "2026-11-08T21:00:00.000000-08:00", "FAR OUTPUT")
 
-    lines, _state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     done = [l for l in lines if l["status"] == "done"]
     assert done[0]["outcome"] == "NEARBY OUTPUT"
 
@@ -172,7 +174,7 @@ def test_outcome_refuses_a_file_beyond_the_match_window(db, env):
     add_row(db, started=started, finished=finished, status="completed")
     write_out(env["out_dir"], "2026-11-08T19:50:00.000000-08:00", "TOO FAR AWAY")
 
-    lines, _state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     done = [l for l in lines if l["status"] == "done"]
     assert done[0]["outcome"] == "finished (no output captured)"
 
@@ -183,7 +185,7 @@ def test_error_row_yields_error_outcome(db, env):
     add_row(db, started="2026-11-08T18:30:36.042103-08:00",
             finished="2026-11-08T18:31:00.000000-08:00", status="failed",
             error="RuntimeError: boom")
-    lines, _state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     done = [l for l in lines if l["status"] == "done"]
     assert done[0]["outcome"] == "ERROR: RuntimeError: boom"
 
@@ -194,7 +196,7 @@ def test_quiet_response_yields_gitops_quiet(db, env):
     add_row(db, started=started, finished=finished, status="completed")
     write_out(env["out_dir"], finished, "GITOPS-QUIET nothing to do")
 
-    lines, _state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     done = [l for l in lines if l["status"] == "done"]
     assert done[0]["outcome"] == "GITOPS-QUIET"
 
@@ -208,8 +210,7 @@ def test_legacy_integer_state_file_is_migrated(db, env):
     with open(env["state"], "w") as fh:
         fh.write(str(running_rowid))
 
-    state = sync.load_state(env["state"])
-    assert state["legacy"] is True
+    state = sync.load_state(env["state"], env["pending"])
     assert state["last_rowid"] == running_rowid
 
     lines, new_state = run_pass(db, env, state)
@@ -220,11 +221,12 @@ def test_legacy_integer_state_file_is_migrated(db, env):
     ledger = read_ledger(env["ledger"])
     assert ledger == []
 
-    # the migrated state file is now JSON
+    # the state file stays a bare integer, so the OLD script can still read it
     with open(env["state"]) as fh:
-        saved = json.load(fh)
-    assert saved["last_rowid"] == running_rowid
-    assert saved["seen_start"] == [running_rowid]
+        assert fh.read().strip() == str(running_rowid)
+    # the in-flight set lives in the sidecar
+    with open(env["pending"]) as fh:
+        assert json.load(fh) == [running_rowid]
 
 
 def test_legacy_state_file_completes_the_in_flight_run(db, env):
@@ -234,7 +236,7 @@ def test_legacy_state_file_completes_the_in_flight_run(db, env):
     with open(env["state"], "w") as fh:
         fh.write(str(rowid))
 
-    state = sync.load_state(env["state"])
+    state = sync.load_state(env["state"], env["pending"])
     lines, new_state = run_pass(db, env, state)
     assert lines == []
 
@@ -246,6 +248,38 @@ def test_legacy_state_file_completes_the_in_flight_run(db, env):
     assert new_state2["seen_start"] == []
 
 
+def test_state_file_stays_readable_by_the_previous_version(db, env):
+    """Rollback safety: the state file must remain a bare integer, because the
+    previous version of this script reads it with int(). Were it JSON, that
+    int() would raise, last_rowid would fall back to 0, and a rollback would
+    re-write a start+done line for every run in the database's history."""
+    add_row(db, started="2026-11-08T18:30:36.042103-08:00",
+            finished="2026-11-08T18:31:00.000000-08:00", status="completed")
+    _lines, state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+
+    with open(env["state"]) as fh:
+        raw = fh.read().strip()
+    assert int(raw) == state["last_rowid"]   # the old int() still works
+    assert not raw.startswith("{")           # not JSON
+
+
+def test_pending_sidecar_survives_a_restart(db, env):
+    """The in-flight set is persisted, so a restart between passes still
+    remembers that a run already got its 'start' line."""
+    started = "2026-11-08T18:30:36.042103-08:00"
+    rowid = add_row(db, started=started, status="running")
+
+    _lines, state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    assert state["seen_start"] == [rowid]
+
+    # simulate a restart: state re-read from disk
+    reloaded = sync.load_state(env["state"], env["pending"])
+    assert reloaded["seen_start"] == [rowid]
+    lines, state2 = run_pass(db, env, reloaded)
+    assert lines == []            # no duplicate start
+    assert state2["seen_start"] == [rowid]
+
+
 # --- (f) the ledger stays one JSON object per line ------------------------
 
 def test_ledger_lines_are_one_json_object_each(db, env):
@@ -254,7 +288,7 @@ def test_ledger_lines_are_one_json_object_each(db, env):
     add_row(db, started=started, finished=finished, status="completed")
     add_row(db, started="2026-11-08T18:40:36.042103-08:00", status="running")
 
-    run_pass(db, env, sync.load_state(env["state"]))
+    run_pass(db, env, sync.load_state(env["state"], env["pending"]))
 
     with open(env["ledger"]) as fh:
         raw = fh.read()
@@ -271,7 +305,7 @@ def test_start_line_is_backdated_to_the_run_start(db, env):
     started = "2026-11-08T18:30:36.042103-08:00"
     add_row(db, started=started, finished="2026-11-08T19:39:34.564870-08:00",
             status="completed")
-    lines, _state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     start = [l for l in lines if l["status"] == "start"][0]
     assert start["time"] == "2026-11-08 18:30:36"
     assert start["trigger"] == "10m poll"
@@ -281,6 +315,6 @@ def test_seen_start_is_pruned_so_it_cannot_grow_without_bound(db, env):
     for i in range(3):
         add_row(db, started="2026-11-08T18:30:36.042103-08:00",
                 finished="2026-11-08T18:31:00.000000-08:00", status="completed")
-    lines, state = run_pass(db, env, sync.load_state(env["state"]))
+    lines, state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     assert len([l for l in lines if l["status"] == "done"]) == 3
     assert state["seen_start"] == []

@@ -25,6 +25,14 @@ from zoneinfo import ZoneInfo
 # sync-written line read an hour AHEAD of the run it described.
 PT = ZoneInfo("America/Los_Angeles")
 STATE_FILE = "/home/dan.rohan/mockup-previews/gitops/.ledger_state"
+# The in-flight rowids live in a SIDECAR file, not in STATE_FILE. STATE_FILE
+# stays a bare integer because the PREVIOUS version of this script read it
+# with int(); if a rollback to that version ever happens, it must still read a
+# valid high-water mark. Were the sidecar merged into STATE_FILE as JSON, the
+# old int() would raise, last_rowid would fall back to 0, and the old script
+# would re-write a 'start'+'done' line for every run in the database's history
+# — a duplicate flood in the ledger. The sidecar keeps rollback safe.
+PENDING_FILE = "/home/dan.rohan/mockup-previews/gitops/.ledger_pending"
 LEDGER = "/home/dan.rohan/mockup-previews/gitops/runs.jsonl"
 JOB_ID = "f42f6ffda76b"
 OUT_DIR = f"/home/dan.rohan/.hermes/cron/output/{JOB_ID}"
@@ -150,36 +158,50 @@ def outcome_line(finished_at, error, out_dir=None):
     return "finished (no output captured)"
 
 
-def load_state(path=None):
-    """Read the state file. Backward compatibility: the live state file holds a
-    bare integer ("82723") written by the old format. A bare int is read as
-    {"last_rowid": <int>, "seen_start": []} and flagged legacy, so the caller
-    can seed seen_start with the in-flight rows the old writer already
-    started."""
+def load_state(path=None, pending_path=None):
+    """Read the high-water mark and the in-flight set.
+
+    STATE_FILE stays a bare integer (the format the previous version of this
+    script wrote), so a rollback to that version still reads a valid mark.
+    The in-flight rowids live in the PENDING_FILE sidecar.
+
+    A state file that holds JSON instead of an integer is accepted too (a
+    forward-format file), and is read leniently.
+    """
     path = STATE_FILE if path is None else path
+    pending_path = PENDING_FILE if pending_path is None else pending_path
     try:
         raw = open(path).read().strip()
     except FileNotFoundError:
         raw = ""
+    last_rowid, legacy = 0, False
     try:
-        data = json.loads(raw)
+        last_rowid = int(raw)
     except ValueError:
-        data = None
-    if isinstance(data, dict):
-        last = int(data.get("last_rowid") or 0)
-        seen = [int(r) for r in (data.get("seen_start") or []) if str(r).lstrip("-").isdigit()]
-        return {"last_rowid": last, "seen_start": seen, "legacy": False}
+        # Maybe a JSON state file (forward format). Read it leniently.
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                last_rowid = int(data.get("last_rowid") or 0)
+        except (ValueError, TypeError):
+            last_rowid = 0
+    seen = []
     try:
-        return {"last_rowid": int(raw), "seen_start": [], "legacy": True}
-    except ValueError:
-        return {"last_rowid": 0, "seen_start": [], "legacy": False}
+        data = json.loads(open(pending_path).read().strip() or "[]")
+        if isinstance(data, list):
+            seen = [int(r) for r in data if str(r).lstrip("-").isdigit()]
+    except (FileNotFoundError, ValueError, TypeError):
+        seen = []
+    return {"last_rowid": last_rowid, "seen_start": seen, "legacy": legacy}
 
 
-def save_state(state, path=None):
+def save_state(state, path=None, pending_path=None):
     path = STATE_FILE if path is None else path
-    payload = {"last_rowid": int(state.get("last_rowid") or 0),
-               "seen_start": sorted(int(r) for r in (state.get("seen_start") or []))}
+    pending_path = PENDING_FILE if pending_path is None else pending_path
     with open(path, "w") as fh:
+        fh.write(str(int(state.get("last_rowid") or 0)))
+    payload = sorted(int(r) for r in (state.get("seen_start") or []))
+    with open(pending_path, "w") as fh:
         fh.write(json.dumps(payload))
 
 
@@ -215,22 +237,26 @@ def build_lines(rows, state, out_dir=None):
     return lines, {"last_rowid": new_max, "seen_start": sorted(seen_start)}
 
 
-def sync_pass(conn, state, ledger=None, state_path=None, out_dir=None, job_id=None):
+def sync_pass(conn, state, ledger=None, state_path=None, out_dir=None, job_id=None,
+              pending_path=None):
     """One sync pass: read state, write ledger lines, write the new state."""
     ledger = LEDGER if ledger is None else ledger
     state_path = STATE_FILE if state_path is None else state_path
+    pending_path = PENDING_FILE if pending_path is None else pending_path
     out_dir = OUT_DIR if out_dir is None else out_dir
     job_id = JOB_ID if job_id is None else job_id
     state = dict(state)
-    if state.get("legacy"):
-        # The old writer advanced last_rowid past rows it only ever saw
-        # 'running', and it had written a 'start' line for them. Seed
-        # seen_start with those in-flight rows so no 'start' line is written
-        # twice, while their 'done' line still gets written when they finish.
+    # The old writer advanced last_rowid past rows it only ever saw 'running',
+    # and it had written a 'start' line for them. On the first pass after an
+    # upgrade, seed seen_start with those in-flight rows so no 'start' line is
+    # written twice, while their 'done' line still gets written when they
+    # finish. This seeding is idempotent and only applies while the pending
+    # sidecar is empty.
+    if not state.get("seen_start"):
         in_flight = {r[0] for r in conn.execute(
             "SELECT rowid FROM executions WHERE job_id=? AND status='running' "
             "AND rowid<=?", (job_id, int(state["last_rowid"])))}
-        state["seen_start"] = sorted(set(state.get("seen_start") or []) | in_flight)
+        state["seen_start"] = sorted(in_flight)
     # A row is a candidate when it is new (rowid > last_rowid), still
     # 'running', or still pending (in seen_start — its 'done' line has not
     # been written yet). The old query (rowid > last_rowid only) skipped every
@@ -249,7 +275,7 @@ def sync_pass(conn, state, ledger=None, state_path=None, out_dir=None, job_id=No
         with open(ledger, "a") as fh:
             for ln in lines:
                 fh.write(json.dumps(ln) + "\n")
-    save_state(new_state, state_path)
+    save_state(new_state, state_path, pending_path)
     return lines, new_state
 
 

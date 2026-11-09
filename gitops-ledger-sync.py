@@ -175,16 +175,57 @@ def out_file_for(finished_at, out_dir=None):
     return best
 
 
+# Character budgets for the human-visible outcome text. The ledger column is
+# rendered on a status page; the budget keeps one line from wrapping.
+OUTCOME_MAX = 120
+ERROR_MAX = 110
+# Single-character ellipsis (U+2026) marking that the text was elided.
+ELLIPSIS = "…"
+
+
+def truncate(text, budget):
+    """Shorten `text` to at most `budget` characters without cutting a word
+    in half.
+
+    A hard character cut (text[:budget]) slices words mid-syllable, so a run
+    whose outcome was "…close two open loops rather than escalate" recorded
+    "...close two open loops rather tha" — unreadable, and it hid the fact
+    that anything had been dropped at all. Instead: cut at the LAST
+    whitespace boundary at or before the budget and append a single
+    ellipsis character, so the reader sees both where the text stops and
+    that it continues.
+
+    Invariants:
+      * the result, ellipsis included, is never longer than `budget`;
+      * text that already fits is returned unchanged, with no ellipsis;
+      * a kept word is never split.
+    """
+    if len(text) <= budget:
+        return text
+    head = text[:budget]
+    # The last whitespace inside the budget is the last boundary we may cut on.
+    cut = -1
+    for m in re.finditer(r"\s", head):
+        cut = m.start()
+    kept = head[:cut].rstrip() if cut > 0 else ""
+    if not kept:
+        # No usable word boundary (a single unbreakable token, or text that
+        # starts with whitespace). There is nothing to elide at a word
+        # boundary, so the budget wins: hard-cut and mark the elision.
+        kept = head[:budget - 1].rstrip()
+    return kept + ELLIPSIS
+
+
 def outcome_line(finished_at, error, out_dir=None):
     if error:
-        return f"ERROR: {error[:110]}"
+        return f"ERROR: {truncate(error, ERROR_MAX)}"
     path = out_file_for(finished_at, out_dir=out_dir)
     if path:
         src = open(path).read()
         resp = src.split("## Response")[-1].strip()
         if "GITOPS-QUIET" in resp[:50]:
             return "GITOPS-QUIET"
-        return resp.split("\n")[0][:120]
+        return truncate(resp.split("\n")[0], OUTCOME_MAX)
     return "finished (no output captured)"
 
 

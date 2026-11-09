@@ -301,6 +301,151 @@ def test_ledger_lines_are_one_json_object_each(db, env):
     assert len(read_ledger(env["ledger"])) == 3
 
 
+# --- (h) the outcome text is cut at a word boundary, not mid-word ---------
+#
+# The old code hard-cut the outcome at exactly 120 characters (110 for the
+# error detail), which sliced words in half: "…close two open loops rather
+# than escalate" was recorded as "...close two open loops rather tha". The
+# reader could not tell a truncated sentence from a complete one, and the
+# clipped fragment was unreadable. The cut now lands on a word boundary and
+# an ellipsis marks that the text was elided.
+
+
+def test_long_outcome_is_cut_at_a_word_boundary(db, env):
+    started = "2026-11-08T18:30:36.042103-08:00"
+    finished = "2026-11-08T18:31:00.000000-08:00"
+    add_row(db, started=started, finished=finished, status="completed")
+    long_response = ("Close two open loops rather than escalate: add credits "
+                     "or lower the request rate for this workspace, then "
+                     "re-run the deploy job and confirm the checks are green.")
+    assert len(long_response) > sync.OUTCOME_MAX
+    write_out(env["out_dir"], finished, long_response)
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    outcome = [l for l in lines if l["status"] == "done"][0]["outcome"]
+
+    # the elision is marked
+    assert outcome.endswith("…")
+    assert sync.ELLIPSIS in outcome
+    # and no word was cut in half: the text before the ellipsis ends on a
+    # complete word, and the truncated word is gone entirely
+    assert not outcome[: -len(sync.ELLIPSIS)].endswith("esc")
+    assert outcome[:-len(sync.ELLIPSIS)] == long_response[:len(outcome) - 1].rstrip()
+    assert outcome[:-len(sync.ELLIPSIS)] in long_response
+
+
+def test_truncated_outcome_never_exceeds_the_budget(db, env):
+    started = "2026-11-08T18:30:36.042103-08:00"
+    finished = "2026-11-08T18:31:00.000000-08:00"
+    add_row(db, started=started, finished=finished, status="completed")
+    write_out(env["out_dir"], finished,
+              "word " * 200 + "tail")  # one very long, whitespace-separated run
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    outcome = [l for l in lines if l["status"] == "done"][0]["outcome"]
+
+    assert len(outcome) <= sync.OUTCOME_MAX
+    assert outcome.endswith(sync.ELLIPSIS)
+
+
+def test_short_outcome_is_returned_unchanged(db, env):
+    started = "2026-11-08T18:30:36.042103-08:00"
+    finished = "2026-11-08T18:31:00.000000-08:00"
+    add_row(db, started=started, finished=finished, status="completed")
+    write_out(env["out_dir"], finished, "run finished cleanly")
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    outcome = [l for l in lines if l["status"] == "done"][0]["outcome"]
+
+    assert outcome == "run finished cleanly"
+    assert sync.ELLIPSIS not in outcome
+
+
+def test_long_error_is_cut_at_a_word_boundary_and_stays_within_budget(db, env):
+    error = ("RuntimeError: the credential for the portal could not be "
+             "refreshed after three attempts, giving up for now and "
+             "scheduling a retry in the next cron cycle")
+    assert len(error) > sync.ERROR_MAX
+    add_row(db, started="2026-11-08T18:30:36.042103-08:00",
+            finished="2026-11-08T18:31:00.000000-08:00", status="failed",
+            error=error)
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    outcome = [l for l in lines if l["status"] == "done"][0]["outcome"]
+
+    assert outcome.startswith("ERROR: ")
+    detail = outcome[len("ERROR: "):]
+    assert detail.endswith(sync.ELLIPSIS)
+    assert len(detail) <= sync.ERROR_MAX
+    assert len(outcome) <= sync.OUTCOME_MAX
+    # the kept text ends on a complete word, never mid-word
+    assert detail[:-len(sync.ELLIPSIS)] in error
+    assert detail[:-len(sync.ELLIPSIS)] == error[:len(detail) - 1].rstrip()
+
+
+def test_gitops_quiet_is_returned_verbatim(db, env):
+    """The QUIET token must never be shortened or ellipsised."""
+    started = "2026-11-08T18:30:36.042103-08:00"
+    finished = "2026-11-08T18:31:00.000000-08:00"
+    add_row(db, started=started, finished=finished, status="completed")
+    write_out(env["out_dir"], finished, "GITOPS-QUIET nothing to do")
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    outcome = [l for l in lines if l["status"] == "done"][0]["outcome"]
+
+    assert outcome == "GITOPS-QUIET"
+
+
+# --- (i) truncate() edge cases -------------------------------------------
+
+def test_truncate_leaves_short_text_untouched():
+    assert sync.truncate("all good", sync.OUTCOME_MAX) == "all good"
+
+
+def test_truncate_leaves_text_at_the_budget_untouched():
+    text = "x" * sync.OUTCOME_MAX
+    assert sync.truncate(text, sync.OUTCOME_MAX) == text
+    assert sync.ELLIPSIS not in sync.truncate(text, sync.OUTCOME_MAX)
+
+
+def test_truncate_handles_empty_text():
+    assert sync.truncate("", sync.OUTCOME_MAX) == ""
+
+
+def test_truncate_handles_text_with_no_whitespace():
+    """A single unbreakable token has no word boundary to cut on; the budget
+    still wins and the elision is still marked."""
+    text = "y" * 300
+    out = sync.truncate(text, sync.OUTCOME_MAX)
+    assert len(out) <= sync.OUTCOME_MAX
+    assert out.endswith(sync.ELLIPSIS)
+
+
+def test_truncate_never_splits_a_word():
+    text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet"
+    out = sync.truncate(text, 30)
+    assert len(out) <= 30
+    assert out.endswith(sync.ELLIPSIS)
+    kept = out[:-len(sync.ELLIPSIS)]
+    assert kept == "alpha bravo charlie delta"
+    for word in kept.split():
+        assert word in text.split()
+
+
+def test_truncate_cuts_at_the_last_boundary_inside_the_budget():
+    text = "aaaa bbbb cccc dddd eeee"
+    # the boundary after "dddd" is the last one at or before 20 chars
+    out = sync.truncate(text, 20)
+    assert out == "aaaa bbbb cccc dddd…"
+    assert len(out) == 20
+
+
+def test_truncate_respects_a_tiny_budget():
+    out = sync.truncate("hello world", 3)
+    assert len(out) <= 3
+    assert out.endswith(sync.ELLIPSIS)
+
+
 # --- extra: the trigger attribution and start backdating are unchanged -----
 
 def test_start_line_is_backdated_to_the_run_start(db, env):

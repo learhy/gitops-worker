@@ -2,10 +2,12 @@
 """Ledger sync: mirror gitops-github-worker run starts/finishes into the
 human-visible ledger (~/mockup-previews/gitops/runs.jsonl).
 
-Runs every 2 min as a no_agent cron job. State is the highest
-executions.rowid already recorded; each new run appends up to two lines:
+Runs every 2 min as a no_agent cron job. State lives in STATE_FILE as JSON:
+{"last_rowid": <int>, "seen_start": [<rowid>, ...]} — last_rowid is the
+highest executions.rowid already recorded, seen_start the rowids that got a
+'start' line but are still in flight. Each run appends up to two lines:
   ▶ started — <trigger>        (trigger attributed from gateway.log)
-  outcome line                 (from the run's output file)
+  outcome line                 (from that run's own output file)
 """
 import json
 import os
@@ -27,11 +29,21 @@ LEDGER = "/home/dan.rohan/mockup-previews/gitops/runs.jsonl"
 JOB_ID = "f42f6ffda76b"
 OUT_DIR = f"/home/dan.rohan/.hermes/cron/output/{JOB_ID}"
 GATEWAY_LOG = "/home/dan.rohan/.hermes/logs/gateway.log"
+CRED_MARK = "/home/dan.rohan/mockup-previews/gitops/.cred_retry_state"
+EXEC_DB = "/home/dan.rohan/.hermes/cron/executions.db"
 TRIGGER_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO gateway\.platforms\.webhook: "
     r"\[webhook\] cron-trigger event=(\S+) route=\S+ job=" + JOB_ID)
+# Output files are named after the run's finish time in local time, e.g. a run
+# that started 18:30:36 and finished 19:39:34 writes 2026-11-08_19-39-34.md.
+OUT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
+# How far (seconds) an output file's timestamp may sit from a row's finished_at
+# and still be attributed to that row.
+OUT_MATCH_WINDOW = 300
 
-os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+# webhook cron-trigger events, indexed from gateway.log (log stamps are UTC).
+# Filled in by main(); attribute_trigger() falls back to "10m poll" when empty.
+triggers = []  # (datetime_utc_naive, event)
 
 # --- self-heal: the worker's concurrent appends can land multiple JSON objects
 # on one line (missing newline between writers), which blanks the status page.
@@ -63,25 +75,6 @@ def _repair_ledger():
             fh.write("\n".join(out) + "\n")
     return fixed
 
-_repair_ledger()
-last_rowid = 0
-if os.path.exists(STATE_FILE):
-    try:
-        last_rowid = int(open(STATE_FILE).read().strip() or 0)
-    except ValueError:
-        last_rowid = 0
-
-# --- build trigger index from gateway.log (webhook fires; log stamps are UTC)
-triggers = []  # (datetime_utc_naive, event)
-try:
-    with open(GATEWAY_LOG, errors="replace") as fh:
-        for line in fh:
-            m = TRIGGER_RE.match(line)
-            if m:
-                dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                triggers.append((dt, m.group(2)))
-except FileNotFoundError:
-    pass
 
 def attribute_trigger(started_iso):
     """Match a run's start to the nearest webhook cron-trigger log line (±10s).
@@ -98,30 +91,12 @@ def attribute_trigger(started_iso):
         delta = abs((start_utc - dt).total_seconds())
         if delta > 10:
             continue
-        better = (
-            best_delta is None
-            or (PRIO.get(ev, 9), delta) < (PRIO.get(best_ev, 9), best_delta)
-        )
+        better = (best_delta is None
+                  or (PRIO.get(ev, 9), delta) < (PRIO.get(best_ev, 9), best_delta))
         if better:
             best_dt, best_ev, best_delta = dt, ev, delta
     return f"webhook:{best_ev}" if best_dt else "10m poll"
 
-def outcome_line(finished_at, error):
-    if error:
-        return f"ERROR: {error[:110]}"
-    files = sorted(glob.glob(f"{OUT_DIR}/*.md"))
-    if finished_at and files:
-        src = open(files[-1]).read()
-        resp = src.split("## Response")[-1].strip()
-        if "GITOPS-QUIET" in resp[:50]:
-            return "GITOPS-QUIET"
-        return resp.split("\n")[0][:120]
-    return "finished (no output captured)"
-
-db = sqlite3.connect("/home/dan.rohan/.hermes/cron/executions.db")
-rows = db.execute(
-    "SELECT rowid, started_at, finished_at, status, error FROM executions "
-    "WHERE job_id=? AND rowid>? ORDER BY rowid", (JOB_ID, last_rowid)).fetchall()
 
 def pt_of(iso_or_none, fallback_dt=None):
     if not iso_or_none:
@@ -131,71 +106,211 @@ def pt_of(iso_or_none, fallback_dt=None):
     except Exception:
         return fallback_dt or datetime.now(PT)
 
-new_lines = []
-new_max = last_rowid
-for rowid, started, finished, status, error in rows:
-    new_max = max(new_max, rowid)
-    t0 = pt_of(started)
-    trig = attribute_trigger(started)
-    if status == "running":
-        new_lines.append({"time": t0.strftime("%Y-%m-%d %H:%M:%S"),
-                          "trigger": trig, "outcome": "▶ started", "status": "start"})
-    else:
-        # backdate the start if we never saw it live
-        new_lines.append({"time": t0.strftime("%Y-%m-%d %H:%M:%S"),
-                          "trigger": trig, "outcome": "▶ started", "status": "start"})
-        t1 = pt_of(finished, t0)
-        new_lines.append({"time": t1.strftime("%Y-%m-%d %H:%M:%S"),
-                          "trigger": trig,
-                          "outcome": outcome_line(finished, error),
-                          "status": "done"})
 
-if new_lines:
-    with open(LEDGER, "a") as fh:
-        for ln in new_lines:
-            fh.write(json.dumps(ln) + "\n")
-with open(STATE_FILE, "w") as fh:
-    fh.write(str(new_max))
+def out_file_for(finished_at, out_dir=None):
+    """The output file belonging to THIS row, or None.
 
-# --- auto-recovery: if a run failed on the portal credential (expires hourly,
-# refresh can transiently fail), re-fire the worker once the token is usable.
-# Cooldown 6 min to avoid loops; retry fires only when a NEW credential failure
-# was observed in this pass.
-CRED_MARK = "/home/dan.rohan/mockup-previews/gitops/.cred_retry_state"
-cred_failures = [l for l in new_lines
-                 if l.get("status") == "done" and "credential missing" in l.get("outcome", "")]
-fired = False
-if cred_failures:
-    now = time.time()
-    last = 0
-    if os.path.exists(CRED_MARK):
+    The old code used files[-1] — the newest file in the directory — which
+    belongs to a different run whenever runs overlap. Instead: prefer the file
+    named after this row's finish time; otherwise accept the closest one
+    within OUT_MATCH_WINDOW seconds, so an unrelated run's file is never
+    attributed to this row."""
+    out_dir = OUT_DIR if out_dir is None else out_dir
+    if not finished_at:
+        return None
+    dt = pt_of(finished_at)
+    exact = os.path.join(out_dir, dt.strftime(OUT_NAME_FMT) + ".md")
+    if os.path.exists(exact):
+        return exact
+    best, best_delta = None, None
+    for path in glob.glob(os.path.join(out_dir, "*.md")):
         try:
-            last = float(open(CRED_MARK).read().strip() or 0)
+            stamp = datetime.strptime(os.path.basename(path)[:-3],
+                                      OUT_NAME_FMT).replace(tzinfo=PT)
         except ValueError:
-            last = 0
-    if now - last > 360:
-        # probe: is the credential usable again? (cheap models endpoint check)
-        probe = subprocess.run(
-            ["bash", "-c",
-             "env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy "
-             "-u ALL_PROXY -u all_proxy python3 - <<'EOF'\n"
-             "import json, urllib.request\n"
-             "key = [l.split('=',1)[1].strip() for l in open('/home/dan.rohan/.hermes/.env') if l.startswith('NOUS_API_KEY=')][0]\n"
-             "req = urllib.request.Request('https://inference-api.nousresearch.com/v1/models')\n"
-             "req.add_header('Authorization', f'Bearer {key}')\n"
-             "urllib.request.urlopen(req, timeout=15)\n"
-             "print('ok')\n"
-             "EOF"],
-            capture_output=True, text=True, timeout=40)
-        if probe.returncode == 0 and "ok" in probe.stdout:
-            subprocess.run(["hermes", "cron", "run", JOB_ID], capture_output=True, timeout=60)
-            with open(LEDGER, "a") as fh:
-                fh.write(json.dumps({"time": datetime.now(PT).strftime("%Y-%m-%d %H:%M:%S"),
-                                     "trigger": "auto-recovery",
-                                     "outcome": f"credential failure detected ({len(cred_failures)} run(s)); credential usable again — worker re-fired",
-                                     "status": "done"}) + "\n")
-            fired = True
-    with open(CRED_MARK, "w") as fh:
-        fh.write(str(now))
-print(f"ledger synced: {len(new_lines)} new lines" + ("; auto-recovery fired" if fired else "")
-      if new_lines else ("ledger clean" + ("; auto-recovery fired" if fired else "")))
+            continue
+        delta = abs((stamp - dt).total_seconds())
+        if delta > OUT_MATCH_WINDOW:
+            continue
+        if best_delta is None or delta < best_delta:
+            best, best_delta = path, delta
+    return best
+
+
+def outcome_line(finished_at, error, out_dir=None):
+    if error:
+        return f"ERROR: {error[:110]}"
+    path = out_file_for(finished_at, out_dir=out_dir)
+    if path:
+        src = open(path).read()
+        resp = src.split("## Response")[-1].strip()
+        if "GITOPS-QUIET" in resp[:50]:
+            return "GITOPS-QUIET"
+        return resp.split("\n")[0][:120]
+    return "finished (no output captured)"
+
+
+def load_state(path=None):
+    """Read the state file. Backward compatibility: the live state file holds a
+    bare integer ("82723") written by the old format. A bare int is read as
+    {"last_rowid": <int>, "seen_start": []} and flagged legacy, so the caller
+    can seed seen_start with the in-flight rows the old writer already
+    started."""
+    path = STATE_FILE if path is None else path
+    try:
+        raw = open(path).read().strip()
+    except FileNotFoundError:
+        raw = ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        last = int(data.get("last_rowid") or 0)
+        seen = [int(r) for r in (data.get("seen_start") or []) if str(r).lstrip("-").isdigit()]
+        return {"last_rowid": last, "seen_start": seen, "legacy": False}
+    try:
+        return {"last_rowid": int(raw), "seen_start": [], "legacy": True}
+    except ValueError:
+        return {"last_rowid": 0, "seen_start": [], "legacy": False}
+
+
+def save_state(state, path=None):
+    path = STATE_FILE if path is None else path
+    payload = {"last_rowid": int(state.get("last_rowid") or 0),
+               "seen_start": sorted(int(r) for r in (state.get("seen_start") or []))}
+    with open(path, "w") as fh:
+        fh.write(json.dumps(payload))
+
+
+def build_lines(rows, state, out_dir=None):
+    """Turn candidate rows into ledger lines plus the next state.
+
+    A row gets its 'start' line exactly once, backdated to its start; its
+    'done' line exactly once, when it is no longer 'running', at which point
+    its rowid leaves seen_start. last_rowid advances only past rows that
+    received a 'done' line, so an unfinished row is never skipped; seen_start
+    keeps only in-flight rows, so it cannot grow without bound."""
+    last_rowid = int(state.get("last_rowid") or 0)
+    seen_start = set(int(r) for r in (state.get("seen_start") or []))
+    lines, new_max = [], last_rowid
+    for rowid, started, finished, status, error in rows:
+        t0 = pt_of(started)
+        trig = attribute_trigger(started)
+        if rowid not in seen_start:
+            seen_start.add(rowid)
+            lines.append({"time": t0.strftime("%Y-%m-%d %H:%M:%S"),
+                          "trigger": trig, "outcome": "▶ started", "status": "start"})
+        if status == "running":
+            continue  # still in flight: the 'done' line waits for a later pass
+        t1 = pt_of(finished, t0)  # backdate the start if we never saw it live
+        lines.append({"time": t1.strftime("%Y-%m-%d %H:%M:%S"),
+                      "trigger": trig,
+                      "outcome": outcome_line(finished, error, out_dir=out_dir),
+                      "status": "done"})
+        seen_start.discard(rowid)
+        new_max = max(new_max, rowid)
+    # a row that vanished from executions.db must not keep seen_start alive
+    seen_start &= {r[0] for r in rows}
+    return lines, {"last_rowid": new_max, "seen_start": sorted(seen_start)}
+
+
+def sync_pass(conn, state, ledger=None, state_path=None, out_dir=None, job_id=None):
+    """One sync pass: read state, write ledger lines, write the new state."""
+    ledger = LEDGER if ledger is None else ledger
+    state_path = STATE_FILE if state_path is None else state_path
+    out_dir = OUT_DIR if out_dir is None else out_dir
+    job_id = JOB_ID if job_id is None else job_id
+    state = dict(state)
+    if state.get("legacy"):
+        # The old writer advanced last_rowid past rows it only ever saw
+        # 'running', and it had written a 'start' line for them. Seed
+        # seen_start with those in-flight rows so no 'start' line is written
+        # twice, while their 'done' line still gets written when they finish.
+        in_flight = {r[0] for r in conn.execute(
+            "SELECT rowid FROM executions WHERE job_id=? AND status='running' "
+            "AND rowid<=?", (job_id, int(state["last_rowid"])))}
+        state["seen_start"] = sorted(set(state.get("seen_start") or []) | in_flight)
+    # A row is a candidate when it is new (rowid > last_rowid), still
+    # 'running', or still pending (in seen_start — its 'done' line has not
+    # been written yet). The old query (rowid > last_rowid only) skipped every
+    # run first seen while still running, so its 'done' line was never written.
+    pending = sorted(int(r) for r in (state.get("seen_start") or []))
+    sql = ("SELECT rowid, started_at, finished_at, status, error FROM executions "
+           "WHERE job_id=? AND (rowid > ? OR status='running'")
+    params = [job_id, int(state["last_rowid"])]
+    if pending:
+        sql += " OR rowid IN (%s)" % ",".join("?" * len(pending))
+        params.extend(pending)
+    sql += ") ORDER BY rowid"
+    rows = conn.execute(sql, params).fetchall()
+    lines, new_state = build_lines(rows, state, out_dir=out_dir)
+    if lines:
+        with open(ledger, "a") as fh:
+            for ln in lines:
+                fh.write(json.dumps(ln) + "\n")
+    save_state(new_state, state_path)
+    return lines, new_state
+
+
+def main():
+    global triggers
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    _repair_ledger()
+    try:
+        with open(GATEWAY_LOG, errors="replace") as fh:
+            for line in fh:
+                m = TRIGGER_RE.match(line)
+                if m:
+                    triggers.append((datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"),
+                                     m.group(2)))
+    except FileNotFoundError:
+        pass
+    conn = sqlite3.connect(EXEC_DB)
+    new_lines, _new_state = sync_pass(conn, load_state())
+
+    # --- auto-recovery: if a run failed on the portal credential (expires hourly,
+    # refresh can transiently fail), re-fire the worker once the token is usable.
+    # Cooldown 6 min to avoid loops; retry fires only when a NEW credential failure
+    # was observed in this pass.
+    cred_failures = [l for l in new_lines
+                     if l.get("status") == "done" and "credential missing" in l.get("outcome", "")]
+    fired = False
+    if cred_failures:
+        now = time.time()
+        last = 0
+        if os.path.exists(CRED_MARK):
+            try:
+                last = float(open(CRED_MARK).read().strip() or 0)
+            except ValueError:
+                last = 0
+        if now - last > 360:
+            # probe: is the credential usable again? (cheap models endpoint check)
+            probe = subprocess.run(
+                ["bash", "-c",
+                 "env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy "
+                 "-u ALL_PROXY -u all_proxy python3 - <<'EOF'\n"
+                 "import json, urllib.request\n"
+                 "key = [l.split('=',1)[1].strip() for l in open('/home/dan.rohan/.hermes/.env') if l.startswith('NOUS_API_KEY=')][0]\n"
+                 "req = urllib.request.Request('https://inference-api.nousresearch.com/v1/models')\n"
+                 "req.add_header('Authorization', f'Bearer {key}')\n"
+                 "urllib.request.urlopen(req, timeout=15)\n"
+                 "print('ok')\n"
+                 "EOF"],
+                capture_output=True, text=True, timeout=40)
+            if probe.returncode == 0 and "ok" in probe.stdout:
+                subprocess.run(["hermes", "cron", "run", JOB_ID], capture_output=True, timeout=60)
+                with open(LEDGER, "a") as fh:
+                    fh.write(json.dumps({"time": datetime.now(PT).strftime("%Y-%m-%d %H:%M:%S"),
+                                         "trigger": "auto-recovery",
+                                         "outcome": f"credential failure detected ({len(cred_failures)} run(s)); credential usable again — worker re-fired",
+                                         "status": "done"}) + "\n")
+                fired = True
+        with open(CRED_MARK, "w") as fh:
+            fh.write(str(now))
+    print(f"ledger synced: {len(new_lines)} new lines" + ("; auto-recovery fired" if fired else "")
+          if new_lines else ("ledger clean" + ("; auto-recovery fired" if fired else "")))
+
+
+if __name__ == "__main__":
+    main()

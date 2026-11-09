@@ -107,12 +107,42 @@ def attribute_trigger(started_iso):
 
 
 def pt_of(iso_or_none, fallback_dt=None):
-    if not iso_or_none:
-        return fallback_dt or datetime.now(PT)
-    try:
-        return datetime.fromisoformat(iso_or_none).astimezone(PT)
-    except Exception:
-        return fallback_dt or datetime.now(PT)
+    """Return a timezone-AWARE Pacific datetime, never a naive one.
+
+    Every caller feeds the result into iso_stamp(), which refuses naive
+    datetimes on purpose: a naive datetime renders without a UTC offset,
+    which is exactly the ambiguity this module exists to avoid."""
+    if iso_or_none:
+        try:
+            return datetime.fromisoformat(iso_or_none).astimezone(PT)
+        except Exception:
+            pass
+    if fallback_dt is not None:
+        # astimezone() on a naive fallback would silently re-interpret it in
+        # the SYSTEM's zone, not Pacific; attaching PT keeps the wall clock.
+        return fallback_dt if fallback_dt.tzinfo else fallback_dt.replace(tzinfo=PT)
+    return datetime.now(PT)
+
+
+def iso_stamp(dt):
+    """Render a datetime as ISO-8601 with an explicit UTC offset.
+
+    The ledger's "time" column is the human-visible truth line, and the live
+    worker prompt already mandates this exact shape for its own lines:
+    ISO-8601 with an explicit offset, taken from
+    `TZ=America/Los_Angeles date -Iseconds`, e.g. "2026-11-08T22:30:50-08:00".
+    The sync script used to write a bare local wall clock, so one column
+    carried two formats — and during the DST fall-back hour the bare clock
+    is genuinely ambiguous (the same wall clock happens twice, an hour apart
+    in real time).
+
+    isoformat() on a tz-aware datetime yields precisely that shape: seconds
+    precision, no microseconds, and an offset with a colon. A naive datetime
+    is rejected rather than rendered, because it would silently produce a
+    string with no offset at all."""
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        raise ValueError("refusing to stamp a naive datetime: %r" % (dt,))
+    return dt.replace(microsecond=0).isoformat()
 
 
 def out_file_for(finished_at, out_dir=None):
@@ -221,12 +251,12 @@ def build_lines(rows, state, out_dir=None):
         trig = attribute_trigger(started)
         if rowid not in seen_start:
             seen_start.add(rowid)
-            lines.append({"time": t0.strftime("%Y-%m-%d %H:%M:%S"),
+            lines.append({"time": iso_stamp(t0),
                           "trigger": trig, "outcome": "▶ started", "status": "start"})
         if status == "running":
             continue  # still in flight: the 'done' line waits for a later pass
         t1 = pt_of(finished, t0)  # backdate the start if we never saw it live
-        lines.append({"time": t1.strftime("%Y-%m-%d %H:%M:%S"),
+        lines.append({"time": iso_stamp(t1),
                       "trigger": trig,
                       "outcome": outcome_line(finished, error, out_dir=out_dir),
                       "status": "done"})
@@ -327,7 +357,7 @@ def main():
             if probe.returncode == 0 and "ok" in probe.stdout:
                 subprocess.run(["hermes", "cron", "run", JOB_ID], capture_output=True, timeout=60)
                 with open(LEDGER, "a") as fh:
-                    fh.write(json.dumps({"time": datetime.now(PT).strftime("%Y-%m-%d %H:%M:%S"),
+                    fh.write(json.dumps({"time": iso_stamp(datetime.now(PT)),
                                          "trigger": "auto-recovery",
                                          "outcome": f"credential failure detected ({len(cred_failures)} run(s)); credential usable again — worker re-fired",
                                          "status": "done"}) + "\n")

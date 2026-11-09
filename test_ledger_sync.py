@@ -9,8 +9,10 @@ tempdir paths.
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
+from datetime import datetime
 
 import pytest
 
@@ -110,7 +112,7 @@ def test_run_first_seen_running_gets_start_then_done(db, env):
 
     assert [l["status"] for l in lines2] == ["done"]
     assert lines2[0]["outcome"] == "run finished cleanly"
-    assert lines2[0]["time"] == "2026-11-08 19:39:34"
+    assert lines2[0]["time"] == "2026-11-08T19:39:34-08:00"
     assert state2["seen_start"] == []
     assert state2["last_rowid"] == rowid
 
@@ -307,7 +309,7 @@ def test_start_line_is_backdated_to_the_run_start(db, env):
             status="completed")
     lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     start = [l for l in lines if l["status"] == "start"][0]
-    assert start["time"] == "2026-11-08 18:30:36"
+    assert start["time"] == "2026-11-08T18:30:36-08:00"
     assert start["trigger"] == "10m poll"
 
 
@@ -318,3 +320,99 @@ def test_seen_start_is_pruned_so_it_cannot_grow_without_bound(db, env):
     lines, state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
     assert len([l for l in lines if l["status"] == "done"]) == 3
     assert state["seen_start"] == []
+
+
+# --- (g) the "time" column is ISO-8601 with an explicit UTC offset ---------
+#
+# The live worker prompt mandates this exact shape for its own ledger lines
+# (ISO-8601 with an offset, taken from `TZ=America/Los_Angeles
+# date -Iseconds`, e.g. "2026-11-08T22:30:50-08:00"). The sync script used
+# to write a bare local wall clock, so one column carried two formats — and
+# during the DST fall-back hour the bare clock is genuinely ambiguous: the
+# same wall clock occurs twice, an hour apart in real time.
+
+# The shape `date -Iseconds` prints: seconds precision, no microseconds,
+# and a UTC offset with a colon.
+ISO_SECONDS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+
+
+def test_dst_offset_follows_the_season(db, env):
+    """July is PDT (-07:00); December is PST (-08:00).
+
+    A hardcoded offset would read an hour AHEAD of the true local time for
+    half the year — the exact bug this offset format exists to prevent."""
+    july_started = "2026-07-04T12:00:00.000000-07:00"
+    july_finished = "2026-07-04T13:30:00.000000-07:00"
+    dec_started = "2026-12-04T12:00:00.000000-08:00"
+    dec_finished = "2026-12-04T13:30:00.000000-08:00"
+    add_row(db, started=july_started, finished=july_finished, status="completed")
+    add_row(db, started=dec_started, finished=dec_finished, status="completed")
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    times = [l["time"] for l in lines]
+    assert times == ["2026-07-04T12:00:00-07:00",
+                     "2026-07-04T13:30:00-07:00",
+                     "2026-12-04T12:00:00-08:00",
+                     "2026-12-04T13:30:00-08:00"]
+    assert "-07:00" in times[0] and "-08:00" in times[2]
+
+
+def test_every_written_line_carries_a_utc_offset(db, env):
+    """No written line may fall back to a bare, offset-less wall clock."""
+    add_row(db, started="2026-07-04T12:00:00.000000-07:00",
+            finished="2026-07-04T13:30:00.000000-07:00", status="completed")
+    add_row(db, started="2026-11-08T18:30:36.042103-08:00", status="running")
+
+    run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+
+    ledger = read_ledger(env["ledger"])
+    assert ledger, "the pass wrote no ledger lines"
+    for line in ledger:
+        parsed = datetime.fromisoformat(line["time"])
+        assert parsed.utcoffset() is not None, (
+            "ledger line has no UTC offset: %r" % (line["time"],))
+
+
+def test_rendered_time_matches_the_date_i_seconds_shape(db, env):
+    """Seconds precision, no microseconds, offset with a colon."""
+    add_row(db, started="2026-11-08T18:30:36.042103-08:00",
+            finished="2026-11-08T19:39:34.564870-08:00", status="completed")
+    write_out(env["out_dir"], "2026-11-08T19:39:34.564870-08:00", "ok")
+
+    lines, _state = run_pass(db, env, sync.load_state(env["state"], env["pending"]))
+    assert lines
+    for line in lines:
+        stamp = line["time"]
+        assert ISO_SECONDS_RE.match(stamp), stamp
+        assert "." not in stamp, "microseconds leaked into the stamp: %r" % (stamp,)
+    # the microseconds of the source instants are dropped, not rounded
+    assert [l["time"] for l in lines] == ["2026-11-08T18:30:36-08:00",
+                                          "2026-11-08T19:39:34-08:00"]
+
+
+def test_iso_stamp_rejects_a_naive_datetime():
+    """A naive datetime would render WITHOUT an offset — refuse it loudly."""
+    naive = datetime(2026, 11, 8, 22, 30, 50)
+    with pytest.raises(ValueError):
+        sync.iso_stamp(naive)
+    # the tz-aware equivalent renders the mandated shape
+    assert sync.iso_stamp(naive.replace(tzinfo=sync.PT)) == "2026-11-08T22:30:50-08:00"
+
+
+def test_pt_of_always_returns_an_aware_datetime():
+    """Every fallback path in pt_of() must stay tz-aware, or the ledger
+    would silently regress to a bare wall clock."""
+    aware = sync.pt_of("2026-11-08T18:30:36.042103-08:00")
+    assert aware.tzinfo is not None and aware.utcoffset() is not None
+    # no input at all -> now() in PT
+    assert sync.pt_of(None).tzinfo is not None
+    # unparseable input -> the same fallback
+    assert sync.pt_of("not-a-timestamp").tzinfo is not None
+    # explicit fallback instant
+    assert sync.pt_of(None, aware).tzinfo is not None
+    # a naive fallback is anchored to PT rather than the system zone
+    naive_fallback = datetime(2026, 11, 8, 18, 30, 36)
+    anchored = sync.pt_of(None, naive_fallback)
+    assert anchored.tzinfo is not None
+    assert anchored.utcoffset() is not None
+    assert anchored.isoformat() == "2026-11-08T18:30:36-08:00"
